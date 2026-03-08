@@ -1,0 +1,9 @@
+{
+    "writingAgent.iflow.enabled": true,
+    "writingAgent.iflow.baseUrl": "https://apis.iflow.cn/v1",
+    "writingAgent.iflow.model": "qwen3-max",
+    "writingAgent.api.enabled": true,
+    "writingAgent.api.provider": "iflow",
+    "writingAgent.api.baseUrl": "https://apis.iflow.cn/v1",
+    "writingAgent.api.model": "qwen3-max"
+}

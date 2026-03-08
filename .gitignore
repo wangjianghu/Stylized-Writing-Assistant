@@ -1,0 +1,19 @@
+out
+node_modules
+.vscode-test/
+*.vsix
+.DS_Store
+*.log
+coverage/
+.env
+data/
+*.skill
+
+# 文档文件（README 保留）
+docs/
+*.md
+*.txt
+*.doc
+*.docx
+*.pdf
+!README.md

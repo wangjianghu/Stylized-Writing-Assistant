@@ -1,0 +1,756 @@
+{
+  "name": "writing-agent",
+  "displayName": "个人写作 Agent",
+  "description": "智能写作助手，自动学习风格，生成风格一致的文章",
+  "version": "0.0.1",
+  "publisher": "your-publisher-id",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Other",
+    "Education"
+  ],
+  "keywords": [
+    "writing",
+    "style",
+    "material",
+    "assistant",
+    "AI"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onCommand:writingAgent.generateArticle",
+    "onCommand:writingAgent.saveMaterial",
+    "onCommand:writingAgent.analyzeStyle",
+    "onCommand:writingAgent.searchMaterial",
+    "onCommand:writingAgent.importArticle",
+    "onCommand:writingAgent.refreshMaterialLibrary",
+    "onCommand:writingAgent.refreshStyleProfile",
+    "onCommand:writingAgent.createStyle",
+    "onCommand:writingAgent.switchStyle",
+    "onCommand:writingAgent.renameStyle",
+    "onCommand:writingAgent.deleteStyle",
+    "onCommand:writingAgent.showAssistantViews",
+    "onCommand:writingAgent.openMaterialLibrary",
+    "onCommand:writingAgent.openStyleProfile",
+    "onView:quickActions",
+    "onView:materialLibrary",
+    "onView:styleProfile",
+    "onView:quickActionsExplorer",
+    "onView:materialLibraryExplorer",
+    "onView:styleProfileExplorer",
+    "onCommand:writingAgent.refreshArticleCollection",
+    "onCommand:writingAgent.showArticleCollection",
+    "onCommand:writingAgent.useHostAI",
+    "onCommand:writingAgent.configureIFlowApi",
+    "onCommand:writingAgent.rewriteSelectionWithIFlow",
+    "onView:articleCollection",
+    "onView:articleCollectionExplorer",
+    "onCommand:writingAgent.applyClipboardToDraft",
+    "onCommand:writingAgent.configureApi",
+    "onCommand:writingAgent.deleteArticle",
+    "onCommand:writingAgent.testApiConnection"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "writingAgent.generateArticle",
+        "title": "写作助手: 生成风格化文章",
+        "shortTitle": "生成"
+      },
+      {
+        "command": "writingAgent.saveMaterial",
+        "title": "写作助手: 保存素材"
+      },
+      {
+        "command": "writingAgent.analyzeStyle",
+        "title": "写作助手: 分析风格",
+        "shortTitle": "分析风格"
+      },
+      {
+        "command": "writingAgent.searchMaterial",
+        "title": "写作助手: 搜索素材",
+        "shortTitle": "搜索"
+      },
+      {
+        "command": "writingAgent.importArticle",
+        "title": "写作助手: 导入样本数据",
+        "shortTitle": "导入"
+      },
+      {
+        "command": "writingAgent.refreshMaterialLibrary",
+        "title": "写作助手: 刷新素材库",
+        "shortTitle": "刷新"
+      },
+      {
+        "command": "writingAgent.refreshStyleProfile",
+        "title": "写作助手: 刷新风格配置",
+        "shortTitle": "刷新"
+      },
+      {
+        "command": "writingAgent.createStyle",
+        "title": "写作助手: 新建风格",
+        "shortTitle": "新建"
+      },
+      {
+        "command": "writingAgent.switchStyle",
+        "title": "写作助手: 切换风格",
+        "shortTitle": "切换风格"
+      },
+      {
+        "command": "writingAgent.renameStyle",
+        "title": "写作助手: 重命名风格",
+        "shortTitle": "重命名"
+      },
+      {
+        "command": "writingAgent.deleteStyle",
+        "title": "写作助手: 删除风格",
+        "shortTitle": "删除风格"
+      },
+      {
+        "command": "writingAgent.showAssistantViews",
+        "title": "写作助手: 显示写作助手"
+      },
+      {
+        "command": "writingAgent.openMaterialLibrary",
+        "title": "写作助手: 打开素材库"
+      },
+      {
+        "command": "writingAgent.openStyleProfile",
+        "title": "写作助手: 打开风格配置"
+      },
+      {
+        "command": "writingAgent.refreshArticleCollection",
+        "title": "写作助手: 刷新文集",
+        "shortTitle": "刷新"
+      },
+      {
+        "command": "writingAgent.showArticleCollection",
+        "title": "写作助手: 打开文集"
+      },
+      {
+        "command": "writingAgent.useHostAI",
+        "title": "写作助手: 使用 IDE AI 续写当前文稿",
+        "shortTitle": "续写"
+      },
+      {
+        "command": "writingAgent.configureIFlowApi",
+        "title": "写作助手: 配置 API（兼容）"
+      },
+      {
+        "command": "writingAgent.rewriteSelectionWithIFlow",
+        "title": "写作助手: AI编辑选中文本",
+        "shortTitle": "改写"
+      },
+      {
+        "command": "writingAgent.applyClipboardToDraft",
+        "title": "写作助手: 从剪贴板写入当前文稿",
+        "shortTitle": "写入结果"
+      },
+      {
+        "command": "writingAgent.configureApi",
+        "title": "写作助手: 配置 API",
+        "shortTitle": "配置 API"
+      },
+      {
+        "command": "writingAgent.deleteArticle",
+        "title": "删除文章"
+      },
+      {
+        "command": "writingAgent.testApiConnection",
+        "title": "写作助手: 测试 API 配置",
+        "shortTitle": "测试 API"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "writing-agent",
+          "title": "写作助手",
+          "icon": "resources/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "writing-agent": [
+        {
+          "id": "quickActions",
+          "name": "快捷入口",
+          "visibility": "visible"
+        },
+        {
+          "id": "articleCollection",
+          "name": "文集",
+          "visibility": "visible"
+        },
+        {
+          "id": "materialLibrary",
+          "name": "素材库",
+          "visibility": "visible"
+        },
+        {
+          "id": "styleProfile",
+          "name": "风格配置",
+          "visibility": "visible"
+        }
+      ],
+      "explorer": [
+        {
+          "id": "quickActionsExplorer",
+          "name": "快捷入口",
+          "visibility": "visible"
+        },
+        {
+          "id": "articleCollectionExplorer",
+          "name": "文集",
+          "visibility": "visible"
+        },
+        {
+          "id": "materialLibraryExplorer",
+          "name": "素材库",
+          "visibility": "visible"
+        },
+        {
+          "id": "styleProfileExplorer",
+          "name": "风格配置",
+          "visibility": "visible"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "quickActions",
+        "contents": "常用入口：\n[导入样本数据](command:writingAgent.importArticle)\n[根据主题写作](command:writingAgent.generateArticle)\n[搜索素材](command:writingAgent.searchMaterial)"
+      },
+      {
+        "view": "materialLibrary",
+        "contents": "素材按当前风格隔离。\n请先创建或切换风格，再导入与搜索。\n[新建风格](command:writingAgent.createStyle)\n[切换风格](command:writingAgent.switchStyle)\n[导入样本数据](command:writingAgent.importArticle)\n[搜索素材](command:writingAgent.searchMaterial)"
+      },
+      {
+        "view": "styleProfile",
+        "contents": "尚未配置风格。\n[新建风格](command:writingAgent.createStyle)\n[导入样本数据](command:writingAgent.importArticle)\n[分析当前文档风格](command:writingAgent.analyzeStyle)"
+      },
+      {
+        "view": "quickActionsExplorer",
+        "contents": "常用入口（Explorer 兜底）：\n[导入样本数据](command:writingAgent.importArticle)\n[根据主题写作](command:writingAgent.generateArticle)\n[搜索素材](command:writingAgent.searchMaterial)"
+      },
+      {
+        "view": "materialLibraryExplorer",
+        "contents": "素材按当前风格隔离（Explorer 兜底入口）。\n请先创建或切换风格，再导入与搜索。\n[新建风格](command:writingAgent.createStyle)\n[切换风格](command:writingAgent.switchStyle)\n[导入样本数据](command:writingAgent.importArticle)\n[搜索素材](command:writingAgent.searchMaterial)"
+      },
+      {
+        "view": "styleProfileExplorer",
+        "contents": "尚未配置风格（Explorer 兜底入口）。\n[新建风格](command:writingAgent.createStyle)\n[导入样本数据](command:writingAgent.importArticle)\n[分析当前文档风格](command:writingAgent.analyzeStyle)"
+      },
+      {
+        "view": "articleCollection",
+        "contents": "文集用于管理已生成文稿。\\n[根据主题写作](command:writingAgent.generateArticle)\\n[打开文集](command:writingAgent.showArticleCollection)\\n[使用 IDE AI 续写当前文稿](command:writingAgent.useHostAI)\\n[配置 API](command:writingAgent.configureApi)\\n[从剪贴板写入当前文稿](command:writingAgent.applyClipboardToDraft)"
+      },
+      {
+        "view": "articleCollectionExplorer",
+        "contents": "文集（Explorer 兜底入口）。\\n[根据主题写作](command:writingAgent.generateArticle)\\n[打开文集](command:writingAgent.showArticleCollection)\\n[使用 IDE AI 续写当前文稿](command:writingAgent.useHostAI)\\n[配置 API](command:writingAgent.configureApi)\\n[从剪贴板写入当前文稿](command:writingAgent.applyClipboardToDraft)"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "writingAgent.generateArticle",
+        "key": "ctrl+shift+g",
+        "mac": "cmd+shift+g"
+      },
+      {
+        "command": "writingAgent.importArticle",
+        "key": "ctrl+shift+i",
+        "mac": "cmd+shift+i"
+      },
+      {
+        "command": "writingAgent.analyzeStyle",
+        "key": "ctrl+shift+a",
+        "mac": "cmd+shift+a"
+      },
+      {
+        "command": "writingAgent.saveMaterial",
+        "key": "ctrl+shift+m",
+        "mac": "cmd+shift+m",
+        "when": "editorTextFocus && editorHasSelection"
+      },
+      {
+        "command": "writingAgent.searchMaterial",
+        "key": "ctrl+shift+s",
+        "mac": "cmd+shift+s"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "writingAgent.generateArticle"
+        },
+        {
+          "command": "writingAgent.saveMaterial"
+        },
+        {
+          "command": "writingAgent.analyzeStyle"
+        },
+        {
+          "command": "writingAgent.searchMaterial"
+        },
+        {
+          "command": "writingAgent.importArticle"
+        },
+        {
+          "command": "writingAgent.refreshMaterialLibrary"
+        },
+        {
+          "command": "writingAgent.refreshStyleProfile"
+        },
+        {
+          "command": "writingAgent.createStyle"
+        },
+        {
+          "command": "writingAgent.switchStyle"
+        },
+        {
+          "command": "writingAgent.renameStyle"
+        },
+        {
+          "command": "writingAgent.deleteStyle"
+        },
+        {
+          "command": "writingAgent.showAssistantViews"
+        },
+        {
+          "command": "writingAgent.openMaterialLibrary"
+        },
+        {
+          "command": "writingAgent.openStyleProfile"
+        },
+        {
+          "command": "writingAgent.refreshArticleCollection"
+        },
+        {
+          "command": "writingAgent.showArticleCollection"
+        },
+        {
+          "command": "writingAgent.useHostAI"
+        },
+        {
+          "command": "writingAgent.rewriteSelectionWithIFlow"
+        },
+        {
+          "command": "writingAgent.applyClipboardToDraft"
+        },
+        {
+          "command": "writingAgent.configureIFlowApi"
+        },
+        {
+          "command": "writingAgent.configureApi"
+        },
+        {
+          "command": "writingAgent.deleteArticle"
+        },
+        {
+          "command": "writingAgent.testApiConnection"
+        }
+      ],
+      "editor/context": [
+        {
+          "when": "editorHasSelection",
+          "command": "writingAgent.rewriteSelectionWithIFlow",
+          "group": "writing@0"
+        },
+        {
+          "when": "editorHasSelection",
+          "command": "writingAgent.saveMaterial",
+          "group": "writing@1"
+        }
+      ],
+      "view/title": [
+        {
+          "when": "view == quickActions",
+          "command": "writingAgent.importArticle",
+          "group": "navigation@1"
+        },
+        {
+          "when": "view == quickActions",
+          "command": "writingAgent.generateArticle",
+          "group": "secondary@1"
+        },
+        {
+          "when": "view == quickActions",
+          "command": "writingAgent.searchMaterial",
+          "group": "secondary@1"
+        },
+        {
+          "when": "view == quickActions",
+          "command": "writingAgent.rewriteSelectionWithIFlow",
+          "group": "secondary@1"
+        },
+        {
+          "when": "view == materialLibrary",
+          "command": "writingAgent.importArticle",
+          "group": "secondary@1"
+        },
+        {
+          "when": "view == materialLibrary",
+          "command": "writingAgent.searchMaterial",
+          "group": "navigation@1"
+        },
+        {
+          "when": "view == materialLibrary",
+          "command": "writingAgent.refreshMaterialLibrary",
+          "group": "secondary@1"
+        },
+        {
+          "when": "view == styleProfile",
+          "command": "writingAgent.createStyle",
+          "group": "secondary@1"
+        },
+        {
+          "when": "view == styleProfile",
+          "command": "writingAgent.switchStyle",
+          "group": "navigation@1"
+        },
+        {
+          "when": "view == styleProfile",
+          "command": "writingAgent.renameStyle",
+          "group": "secondary@1"
+        },
+        {
+          "when": "view == styleProfile",
+          "command": "writingAgent.deleteStyle",
+          "group": "secondary@1"
+        },
+        {
+          "when": "view == styleProfile",
+          "command": "writingAgent.analyzeStyle",
+          "group": "secondary@1"
+        },
+        {
+          "when": "view == styleProfile",
+          "command": "writingAgent.refreshStyleProfile",
+          "group": "secondary@1"
+        },
+        {
+          "when": "view == materialLibraryExplorer",
+          "command": "writingAgent.importArticle",
+          "group": "secondary@1"
+        },
+        {
+          "when": "view == materialLibraryExplorer",
+          "command": "writingAgent.searchMaterial",
+          "group": "navigation@1"
+        },
+        {
+          "when": "view == materialLibraryExplorer",
+          "command": "writingAgent.refreshMaterialLibrary",
+          "group": "secondary@1"
+        },
+        {
+          "when": "view == styleProfileExplorer",
+          "command": "writingAgent.createStyle",
+          "group": "secondary@1"
+        },
+        {
+          "when": "view == styleProfileExplorer",
+          "command": "writingAgent.switchStyle",
+          "group": "navigation@1"
+        },
+        {
+          "when": "view == styleProfileExplorer",
+          "command": "writingAgent.renameStyle",
+          "group": "secondary@1"
+        },
+        {
+          "when": "view == styleProfileExplorer",
+          "command": "writingAgent.deleteStyle",
+          "group": "secondary@1"
+        },
+        {
+          "when": "view == styleProfileExplorer",
+          "command": "writingAgent.analyzeStyle",
+          "group": "secondary@1"
+        },
+        {
+          "when": "view == styleProfileExplorer",
+          "command": "writingAgent.refreshStyleProfile",
+          "group": "secondary@1"
+        },
+        {
+          "when": "view == quickActionsExplorer",
+          "command": "writingAgent.importArticle",
+          "group": "navigation@1"
+        },
+        {
+          "when": "view == quickActionsExplorer",
+          "command": "writingAgent.generateArticle",
+          "group": "secondary@1"
+        },
+        {
+          "when": "view == quickActionsExplorer",
+          "command": "writingAgent.searchMaterial",
+          "group": "secondary@1"
+        },
+        {
+          "when": "view == quickActionsExplorer",
+          "command": "writingAgent.rewriteSelectionWithIFlow",
+          "group": "secondary@1"
+        },
+        {
+          "when": "view == articleCollection",
+          "command": "writingAgent.generateArticle",
+          "group": "secondary@1"
+        },
+        {
+          "when": "view == articleCollection",
+          "command": "writingAgent.useHostAI",
+          "group": "secondary@1"
+        },
+        {
+          "when": "view == articleCollection",
+          "command": "writingAgent.configureApi",
+          "group": "secondary@1"
+        },
+        {
+          "when": "view == articleCollection",
+          "command": "writingAgent.refreshArticleCollection",
+          "group": "secondary@1"
+        },
+        {
+          "when": "view == articleCollectionExplorer",
+          "command": "writingAgent.generateArticle",
+          "group": "secondary@1"
+        },
+        {
+          "when": "view == articleCollectionExplorer",
+          "command": "writingAgent.useHostAI",
+          "group": "secondary@1"
+        },
+        {
+          "when": "view == articleCollectionExplorer",
+          "command": "writingAgent.configureApi",
+          "group": "secondary@1"
+        },
+        {
+          "when": "view == articleCollectionExplorer",
+          "command": "writingAgent.refreshArticleCollection",
+          "group": "secondary@1"
+        },
+        {
+          "when": "view == articleCollection",
+          "command": "writingAgent.applyClipboardToDraft",
+          "group": "secondary@1"
+        },
+        {
+          "when": "view == articleCollectionExplorer",
+          "command": "writingAgent.applyClipboardToDraft",
+          "group": "secondary@1"
+        },
+        {
+          "when": "view == quickActions",
+          "command": "writingAgent.testApiConnection",
+          "group": "secondary@1"
+        },
+        {
+          "when": "view == quickActionsExplorer",
+          "command": "writingAgent.testApiConnection",
+          "group": "secondary@1"
+        },
+        {
+          "when": "view == articleCollection",
+          "command": "writingAgent.testApiConnection",
+          "group": "secondary@1"
+        },
+        {
+          "when": "view == articleCollectionExplorer",
+          "command": "writingAgent.testApiConnection",
+          "group": "secondary@1"
+        },
+        {
+          "when": "view == articleCollection",
+          "command": "writingAgent.switchStyle",
+          "group": "navigation@1"
+        },
+        {
+          "when": "view == articleCollectionExplorer",
+          "command": "writingAgent.switchStyle",
+          "group": "navigation@1"
+        }
+      ],
+      "view/item/context": [
+        {
+          "when": "view == articleCollection && viewItem == writingAgent.articleStyleItem",
+          "command": "writingAgent.switchStyle",
+          "group": "navigation@8"
+        },
+        {
+          "when": "view == articleCollectionExplorer && viewItem == writingAgent.articleStyleItem",
+          "command": "writingAgent.switchStyle",
+          "group": "navigation@8"
+        },
+        {
+          "when": "view == articleCollection && viewItem == writingAgent.articleItem",
+          "command": "writingAgent.deleteArticle",
+          "group": "navigation@9"
+        },
+        {
+          "when": "view == articleCollectionExplorer && viewItem == writingAgent.articleItem",
+          "command": "writingAgent.deleteArticle",
+          "group": "navigation@9"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "写作助手",
+      "properties": {
+        "writingAgent.autoExtract": {
+          "type": "boolean",
+          "default": true,
+          "description": "自动提取素材"
+        },
+        "writingAgent.suggestionDelay": {
+          "type": "number",
+          "default": 500,
+          "description": "建议延迟时间（毫秒）"
+        },
+        "writingAgent.ai.channel": {
+          "type": "string",
+          "default": "api",
+          "enum": [
+            "api",
+            "ide-chat"
+          ],
+          "enumDescriptions": [
+            "默认：使用统一 API 直接生成结果",
+            "可选：使用 IDE AI 对话，并自动填充提示词到 Chat 输入框（宿主支持时）"
+          ],
+          "description": "根据主题写作、续写、选区改写的 AI 通道"
+        },
+        "writingAgent.iflow.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "是否启用心流 API 作为文章生成主通道",
+          "markdownDeprecationMessage": "已兼容读取，建议迁移到 `writingAgent.api.*`。"
+        },
+        "writingAgent.iflow.baseUrl": {
+          "type": "string",
+          "default": "https://apis.iflow.cn/v1",
+          "description": "心流 API Base URL（OpenAI 兼容）",
+          "markdownDeprecationMessage": "已兼容读取，建议迁移到 `writingAgent.api.*`。"
+        },
+        "writingAgent.iflow.model": {
+          "type": "string",
+          "default": "Qwen/Qwen3-8B",
+          "description": "心流 API 模型名称",
+          "markdownDeprecationMessage": "已兼容读取，建议迁移到 `writingAgent.api.*`。"
+        },
+        "writingAgent.iflow.apiKey": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "兼容旧字段。建议使用命令“写作助手: 配置 API”并迁移到 `writingAgent.api.*`；也可设置环境变量 `IFLOW_API_KEY`。",
+          "markdownDeprecationMessage": "已兼容读取，建议迁移到 `writingAgent.api.*`。"
+        },
+        "writingAgent.iflow.temperature": {
+          "type": "number",
+          "default": 0.7,
+          "minimum": 0,
+          "maximum": 2,
+          "description": "心流 API 生成温度",
+          "markdownDeprecationMessage": "已兼容读取，建议迁移到 `writingAgent.api.*`。"
+        },
+        "writingAgent.iflow.maxTokens": {
+          "type": "number",
+          "default": 2200,
+          "minimum": 200,
+          "description": "心流 API 最大输出 token 数",
+          "markdownDeprecationMessage": "已兼容读取，建议迁移到 `writingAgent.api.*`。"
+        },
+        "writingAgent.iflow.timeoutMs": {
+          "type": "number",
+          "default": 60000,
+          "minimum": 5000,
+          "description": "心流 API 请求超时（毫秒）",
+          "markdownDeprecationMessage": "已兼容读取，建议迁移到 `writingAgent.api.*`。"
+        },
+        "writingAgent.api.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "是否启用统一 API 作为文章生成主通道"
+        },
+        "writingAgent.api.provider": {
+          "type": "string",
+          "default": "iflow",
+          "enum": [
+            "iflow",
+            "kimi",
+            "deepseek",
+            "minimax",
+            "qwen",
+            "custom"
+          ],
+          "enumDescriptions": [
+            "心流",
+            "Kimi",
+            "DeepSeek",
+            "MiniMax",
+            "千问",
+            "自定义 OpenAI 兼容"
+          ],
+          "description": "当前启用的 API 提供商"
+        },
+        "writingAgent.api.baseUrl": {
+          "type": "string",
+          "default": "https://apis.iflow.cn/v1",
+          "description": "统一 API Base URL（OpenAI 兼容）"
+        },
+        "writingAgent.api.model": {
+          "type": "string",
+          "default": "Qwen/Qwen3-8B",
+          "description": "统一 API 模型名称"
+        },
+        "writingAgent.api.temperature": {
+          "type": "number",
+          "default": 0.7,
+          "minimum": 0,
+          "maximum": 2,
+          "description": "统一 API 生成温度"
+        },
+        "writingAgent.api.maxTokens": {
+          "type": "number",
+          "default": 2200,
+          "minimum": 200,
+          "description": "统一 API 最大输出 token 数"
+        },
+        "writingAgent.api.timeoutMs": {
+          "type": "number",
+          "default": 60000,
+          "minimum": 5000,
+          "description": "统一 API 请求超时（毫秒）"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "test": "jest"
+  },
+  "devDependencies": {
+    "@types/jest": "^29.0.0",
+    "@types/node": "^18.0.0",
+    "@types/uuid": "^10.0.0",
+    "@types/vscode": "^1.75.0",
+    "jest": "^29.0.0",
+    "typescript": "^5.0.0"
+  },
+  "dependencies": {
+    "better-sqlite3": "^9.0.0",
+    "mammoth": "^1.6.0",
+    "natural": "^6.0.0",
+    "nodejieba": "^2.6.0",
+    "pdf-parse": "^1.1.1",
+    "sentiment": "^5.0.0",
+    "xlsx": "^0.18.5"
+  }
+}
