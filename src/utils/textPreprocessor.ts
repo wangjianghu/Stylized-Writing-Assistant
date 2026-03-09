@@ -1,4 +1,26 @@
-import * as nodejieba from 'nodejieba';
+type NodeJiebaLike = {
+  cut: (text: string) => string[];
+};
+
+let cachedNodeJieba: NodeJiebaLike | null | undefined;
+
+function loadNodeJieba(): NodeJiebaLike | null {
+  if (cachedNodeJieba !== undefined) {
+    return cachedNodeJieba;
+  }
+
+  try {
+    // 延迟加载可选原生依赖，避免宿主不支持时导致插件激活失败。
+    // eslint-disable-next-line @typescript-eslint/no-var-requires, global-require
+    cachedNodeJieba = require('nodejieba') as NodeJiebaLike;
+    return cachedNodeJieba;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`[writing-agent] nodejieba 加载失败，降级使用基础分词：${message}`);
+    cachedNodeJieba = null;
+    return null;
+  }
+}
 
 /**
  * 文本预处理器
@@ -8,8 +30,13 @@ export class TextPreprocessor {
    * 中文分词
    */
   tokenize(text: string): string[] {
+    const nodeJieba = loadNodeJieba();
+    if (!nodeJieba) {
+      return this.simpleTokenize(text);
+    }
+
     try {
-      return nodejieba.cut(text);
+      return nodeJieba.cut(text);
     } catch (error) {
       // 如果 nodejieba 不可用，使用简单的分词
       return this.simpleTokenize(text);

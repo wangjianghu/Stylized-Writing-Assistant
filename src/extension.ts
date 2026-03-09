@@ -1,6 +1,8 @@
 import * as vscode from 'vscode';
-import * as mammoth from 'mammoth';
-import { MaterialType, StyleProfile, WritingStyle } from './core/types';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import { MaterialType, StyleProfile, WritingMaterial, WritingStyle } from './core/types';
 import { StyleEngine } from './core/styleEngine';
 import { MaterialExtractor } from './core/materialManager/extractor';
 import { MaterialRepository } from './core/materialManager/repository';
@@ -81,14 +83,56 @@ interface MergeStyleArticlesResult {
   missingFiles: number;
 }
 
+interface MaterialSedimentationResult {
+  processedArticles: number;
+  addedMaterials: number;
+}
+
+interface StyleArticleIndexSyncResult {
+  indexedRecords: number;
+  scannedFiles: number;
+}
+
+type SuggestionSourceType = 'material' | 'article';
+
+interface SuggestionCandidate {
+  text: string;
+  styleId: string;
+  styleName: string;
+  sourceType: SuggestionSourceType;
+  isCurrentStyle: boolean;
+  quality: number;
+}
+
+interface SuggestionBucketCache {
+  items: SuggestionCandidate[];
+  builtAt: number;
+}
+
+type MammothModule = {
+  extractRawText: (input: { buffer: Buffer }) => Promise<{ value?: string }>;
+};
+
 const LEGACY_IFLOW_SECRET_KEY = 'writingAgent.iflow.apiKey';
 const API_VALIDATION_STATE_KEY = 'writingAgent.api.validation.v1';
-const LEGACY_COLLECTION_RELATIVE_PREFIX = '.writing-agent/文集';
 const COLLECTION_RELATIVE_PREFIX = '文集';
+const LEGACY_COLLECTION_RELATIVE_PREFIX = '.writing-agent/文集';
+const STORAGE_DATA_RELATIVE_PREFIX = 'data';
+const STORAGE_DEFAULT_DIR_NAME = 'writing-angent';
 const STATUS_MESSAGE_TIMEOUT_MS = 5000;
 const SHOW_ASSISTANT_DEBOUNCE_MS = 1200;
+const SUGGESTION_CACHE_TTL_MS = 20_000;
+const COMPLETION_MAX_ITEMS = 6;
+const COMPLETION_DOCUMENT_SELECTOR: vscode.DocumentSelector = [
+  { scheme: 'file', language: 'markdown' },
+  { scheme: 'untitled', language: 'markdown' },
+  { scheme: 'file', language: 'plaintext' },
+  { scheme: 'untitled', language: 'plaintext' }
+];
+const COMPLETION_TRIGGER_CHARACTERS = [' ', '，', '。', '；', '：', ',', '.', ';', ':', '、', '！', '？'];
 let showAssistantViewLockUntil = 0;
 let showAssistantViewsInFlight: Promise<void> | null = null;
+let cachedMammothModule: MammothModule | null | undefined;
 const PROVIDER_PRESETS: Record<ApiProvider, ProviderPreset> = {
   iflow: {
     provider: 'iflow',
@@ -133,11 +177,12 @@ export function activate(context: vscode.ExtensionContext): void {
   console.log(`[writing-agent] vscode.version=${vscode.version}`);
   console.log(`[writing-agent] extensionPath=${context.extensionPath}`);
 
+  const storageRootPath = resolveStorageRootPath();
   const styleEngine = new StyleEngine();
   const materialExtractor = new MaterialExtractor();
-  const materialRepository = new MaterialRepository(context);
-  const styleRepository = new StyleRepository(context);
-  const articleRepository = new ArticleRepository(context);
+  const materialRepository = new MaterialRepository(context, storageRootPath);
+  const styleRepository = new StyleRepository(context, storageRootPath);
+  const articleRepository = new ArticleRepository(context, storageRootPath);
   const quickEntryProvider = new QuickEntryProvider(async () => {
     const settings = await resolveApiSettings(context);
     if (!settings || !settings.enabled) {
@@ -176,11 +221,7 @@ export function activate(context: vscode.ExtensionContext): void {
       return { id: active.id, name: active.name };
     },
     relativePath => {
-      const root = getPrimaryWorkspaceRootUri();
-      if (!root) {
-        return null;
-      }
-      return vscode.Uri.joinPath(root, ...relativePath.split('/'));
+      return resolveArticleUriByRelativePath(relativePath);
     }
   );
 
@@ -190,6 +231,19 @@ export function activate(context: vscode.ExtensionContext): void {
   } else {
     styleEngine.resetStyle();
   }
+  const suggestionBucketCache = new Map<string, SuggestionBucketCache>();
+  const suggestionTriggerTimers = new Map<string, NodeJS.Timeout>();
+  const clearSuggestionCache = (styleId?: string): void => {
+    if (styleId) {
+      suggestionBucketCache.delete(styleId);
+      return;
+    }
+    suggestionBucketCache.clear();
+  };
+  const clearSuggestionTimers = (): void => {
+    suggestionTriggerTimers.forEach(timer => clearTimeout(timer));
+    suggestionTriggerTimers.clear();
+  };
 
   context.subscriptions.push(
     vscode.window.registerTreeDataProvider('quickActions', quickEntryProvider),
@@ -202,16 +256,85 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.window.registerTreeDataProvider('styleProfileExplorer', styleProfileProvider)
   );
   context.subscriptions.push(
+    vscode.languages.registerCompletionItemProvider(
+      COMPLETION_DOCUMENT_SELECTOR,
+      {
+        async provideCompletionItems(document, position) {
+          const linePrefix = document.lineAt(position.line).text.slice(0, position.character);
+          const minTriggerChars = getSuggestionMinChars();
+          const query = extractSuggestionQuery(linePrefix);
+          if (!query || query.length < minTriggerChars) {
+            return [];
+          }
+
+          const matched = await collectCompletionSuggestions(
+            query,
+            styleRepository,
+            materialRepository,
+            articleRepository,
+            suggestionBucketCache
+          );
+          if (matched.length === 0) {
+            return [];
+          }
+
+          const replaceRange = resolveSuggestionReplaceRange(document, position, query);
+          return matched.map((entry, index) => createCompletionItem(entry, index, replaceRange));
+        }
+      },
+      ...COMPLETION_TRIGGER_CHARACTERS
+    ),
+    vscode.workspace.onDidChangeTextDocument(event => {
+      scheduleSuggestionTrigger(event, suggestionTriggerTimers);
+    }),
+    {
+      dispose: () => {
+        clearSuggestionTimers();
+      }
+    }
+  );
+  context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration(event => {
-      if (event.affectsConfiguration('writingAgent.api') || event.affectsConfiguration('writingAgent.iflow')) {
+      if (
+        event.affectsConfiguration('writingAgent.api')
+        || event.affectsConfiguration('writingAgent.iflow')
+        || event.affectsConfiguration('writingAgent.storage.path')
+      ) {
         quickEntryProvider.refresh();
+      }
+      if (event.affectsConfiguration('writingAgent.storage.path')) {
+        void ensureStorageDirectories().catch(error => {
+          const message = error instanceof Error ? error.message : String(error);
+          vscode.window.showErrorMessage(`写作助手存储目录初始化失败：${message}`);
+        });
+        void vscode.window.showInformationMessage(
+          `写作助手存储路径已更新为：${resolveStorageRootPath()}。重载窗口后生效。`,
+          '立即重载'
+        ).then(action => {
+          if (action === '立即重载') {
+            void vscode.commands.executeCommand('workbench.action.reloadWindow');
+          }
+        });
+      }
+      if (
+        event.affectsConfiguration('writingAgent.suggestionDelay')
+        || event.affectsConfiguration('writingAgent.suggestionMinChars')
+      ) {
+        clearSuggestionTimers();
       }
     })
   );
   void (async () => {
-    await migrateArticleCollectionToVisibleRoot(articleRepository, articleCollectionProvider);
-    await syncArticleCollectionWithDisk(articleRepository, articleCollectionProvider);
-    articleCollectionProvider.refresh();
+    try {
+      await ensureStorageDirectories();
+      await migrateLegacyCollectionDirectory(articleRepository);
+      await syncArticleCollectionWithDisk(articleRepository, articleCollectionProvider);
+      articleCollectionProvider.refresh();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error('[writing-agent] 初始化文集目录失败', message);
+      notifyWarn(`初始化文集目录失败：${message}`);
+    }
   })();
 
   registerSafeCommand(context, 'writingAgent.generateArticle', async () => {
@@ -254,10 +377,8 @@ export function activate(context: vscode.ExtensionContext): void {
       },
       async progress => {
         progress.report({ increment: 0, message: '准备文集路径...' });
-        const root = getPrimaryWorkspaceRootUri();
-        if (!root) {
-          throw new Error('请先在开发宿主中打开工作区，再生成文章。');
-        }
+        const root = resolveStorageRootUri();
+        await ensureStorageDirectories();
 
         const styleName = active?.name || '默认风格';
         const styleId = active?.id || 'default-style';
@@ -291,6 +412,7 @@ export function activate(context: vscode.ExtensionContext): void {
           styleName,
           relativePath: articleFile.relativePath
         });
+        clearSuggestionCache(styleId);
         articleCollectionProvider.refresh();
 
         progress.report({ increment: 65, message: '打开文稿...' });
@@ -380,6 +502,7 @@ export function activate(context: vscode.ExtensionContext): void {
           relativePath: articleFile.relativePath,
           aiCommand
         });
+        clearSuggestionCache(styleId);
 
         progress.report({ increment: 100, message: '完成' });
         const message = outputMode === 'outline'
@@ -489,6 +612,7 @@ export function activate(context: vscode.ExtensionContext): void {
         if (learnedCount === 0) {
           if (targetDecision.mode === 'create') {
             await styleRepository.deleteProfile(targetProfile.id);
+            clearSuggestionCache(targetProfile.id);
           }
           await restoreActiveStyle(styleRepository, styleEngine, previousActiveProfile?.id || null);
           styleProfileProvider.refresh();
@@ -507,6 +631,7 @@ export function activate(context: vscode.ExtensionContext): void {
         materialLibraryProvider.refresh();
         styleProfileProvider.refresh();
         articleCollectionProvider.refresh();
+        clearSuggestionCache(targetProfile.id);
 
         const currentStyle = styleEngine.getCurrentStyle();
         const avgSentenceLength = currentStyle?.sentenceStructure.avgLength.toFixed(1) || '0.0';
@@ -586,6 +711,7 @@ export function activate(context: vscode.ExtensionContext): void {
       editor.document.uri.toString()
     );
     materialLibraryProvider.refresh();
+    clearSuggestionCache(activeProfile.id);
     notifyInfo(`已保存素材：${material.name}`);
   });
 
@@ -618,6 +744,55 @@ export function activate(context: vscode.ExtensionContext): void {
     });
   });
 
+  registerSafeCommand(context, 'writingAgent.exportMaterials', async () => {
+    const activeProfile = styleRepository.getActiveProfile();
+    if (!activeProfile) {
+      const action = await vscode.window.showWarningMessage(
+        '当前没有激活风格，请先导入样本数据或创建风格后再导出素材。',
+        '新建风格',
+        '导入样本数据',
+        '切换风格'
+      );
+      if (action === '新建风格') {
+        await vscode.commands.executeCommand('writingAgent.createStyle');
+      } else if (action === '导入样本数据') {
+        await vscode.commands.executeCommand('writingAgent.importArticle');
+      } else if (action === '切换风格') {
+        await vscode.commands.executeCommand('writingAgent.switchStyle');
+      }
+      return;
+    }
+
+    const materials = materialRepository.search(activeProfile.id, { limit: 2000 });
+    if (materials.length === 0) {
+      notifyWarn('当前风格素材为空，暂无可导出内容。');
+      return;
+    }
+
+    const fileName = `${sanitizePathSegment(activeProfile.name)}-素材导出-${formatTimestamp(new Date())}.md`;
+    const defaultUri = vscode.Uri.joinPath(resolveStorageRootUri(), 'exports', fileName);
+    const targetUri = await vscode.window.showSaveDialog({
+      saveLabel: '导出素材',
+      defaultUri,
+      filters: { Markdown: ['md'] }
+    });
+    if (!targetUri) {
+      return;
+    }
+
+    await vscode.workspace.fs.createDirectory(getParentUri(targetUri));
+    const markdown = buildMaterialExportMarkdown(activeProfile.name, materials);
+    await vscode.workspace.fs.writeFile(targetUri, Buffer.from(markdown, 'utf-8'));
+
+    const action = await vscode.window.showInformationMessage(
+      `已导出 ${materials.length} 条素材到 ${targetUri.fsPath}`,
+      '打开文件'
+    );
+    if (action === '打开文件') {
+      await vscode.commands.executeCommand('vscode.open', targetUri);
+    }
+  });
+
   registerSafeCommand(context, 'writingAgent.createStyle', async () => {
     const mode = await vscode.window.showQuickPick(
       [
@@ -646,6 +821,7 @@ export function activate(context: vscode.ExtensionContext): void {
     styleProfileProvider.refresh();
     materialLibraryProvider.refresh();
     articleCollectionProvider.refresh();
+    clearSuggestionCache();
     notifyInfo(`已创建风格：${profile.name}`);
   });
 
@@ -685,6 +861,7 @@ export function activate(context: vscode.ExtensionContext): void {
     styleProfileProvider.refresh();
     materialLibraryProvider.refresh();
     articleCollectionProvider.refresh();
+    clearSuggestionCache();
     notifyInfo(`已切换到风格：${target.name}`);
   });
 
@@ -706,6 +883,7 @@ export function activate(context: vscode.ExtensionContext): void {
     styleProfileProvider.refresh();
     materialLibraryProvider.refresh();
     articleCollectionProvider.refresh();
+    clearSuggestionCache(target.id);
     notifyInfo('风格名称已更新。');
   });
 
@@ -762,17 +940,17 @@ export function activate(context: vscode.ExtensionContext): void {
     }
 
     const activeProfileIdBeforeDelete = styleRepository.getActiveProfileId();
-    const workspaceRoot = getPrimaryWorkspaceRootUri();
+    const storageRoot = resolveStorageRootUri();
 
     let materialResult: { moved: number; merged: number } | undefined;
     let articleDeleteResult: DeleteStyleArticlesResult | undefined;
     let articleMergeResult: MergeStyleArticlesResult | undefined;
     if (strategy.value === 'merge-all' && mergeTarget) {
       materialResult = await materialRepository.moveStyleMaterials(target.id, mergeTarget.id);
-      articleMergeResult = await moveArticlesToStyle(target, mergeTarget, articleRepository, workspaceRoot);
+      articleMergeResult = await moveArticlesToStyle(target, mergeTarget, articleRepository, storageRoot);
     } else {
       await materialRepository.deleteStyleMaterials(target.id);
-      articleDeleteResult = await removeArticlesByStyle(target.id, articleRepository, workspaceRoot);
+      articleDeleteResult = await removeArticlesByStyle(target.id, articleRepository, storageRoot);
     }
 
     await styleRepository.deleteProfile(target.id);
@@ -790,6 +968,7 @@ export function activate(context: vscode.ExtensionContext): void {
     styleProfileProvider.refresh();
     materialLibraryProvider.refresh();
     articleCollectionProvider.refresh();
+    clearSuggestionCache();
     if (materialResult) {
       notifyInfo(
         `已删除风格：${target.name}。已合并到「${mergeTarget?.name}」：素材新增 ${materialResult.moved} 条、去重 ${materialResult.merged} 条；文章迁移 ${articleMergeResult?.movedFiles || 0} 篇，索引更新 ${articleMergeResult?.updatedRecords || 0} 篇。`
@@ -802,20 +981,35 @@ export function activate(context: vscode.ExtensionContext): void {
   });
 
   registerSafeCommand(context, 'writingAgent.refreshMaterialLibrary', async () => {
+    const active = styleRepository.getActiveProfile();
+    if (!active) {
+      materialLibraryProvider.refresh();
+      notifyWarn('素材库已刷新。当前未激活风格，未执行文集沉淀。');
+      return;
+    }
+
+    const indexSync = await syncStyleArticleIndexFromDisk(active, articleRepository);
+    const sedimentation = await sedimentCurrentStyleArticlesToMaterials(
+      active,
+      articleRepository,
+      materialExtractor,
+      materialRepository
+    );
     materialLibraryProvider.refresh();
+    clearSuggestionCache(active.id);
+    notifyInfo(
+      `素材库已刷新：扫描 ${indexSync.scannedFiles} 篇文集文件，同步 ${indexSync.indexedRecords} 条索引，已处理 ${sedimentation.processedArticles} 篇并沉淀新增 ${sedimentation.addedMaterials} 条素材。`
+    );
   });
 
   registerSafeCommand(context, 'writingAgent.refreshArticleCollection', async () => {
     await syncArticleCollectionWithDisk(articleRepository, articleCollectionProvider, { notifyOnCleanup: true });
     articleCollectionProvider.refresh();
+    clearSuggestionCache();
   });
 
   registerSafeCommand(context, 'writingAgent.deleteArticle', async (arg?: unknown) => {
-    const root = getPrimaryWorkspaceRootUri();
-    if (!root) {
-      notifyWarn('请先打开工作区，再删除文集文章。');
-      return;
-    }
+    const root = resolveStorageRootUri();
 
     const target = await resolveArticleRecordTarget(arg, articleRepository);
     if (!target) {
@@ -831,7 +1025,7 @@ export function activate(context: vscode.ExtensionContext): void {
       return;
     }
 
-    const articleUri = vscode.Uri.joinPath(root, ...target.relativePath.split('/'));
+    const articleUri = await resolveArticleUriForDelete(target.relativePath, root);
     let fileDeleted = false;
     try {
       if (await uriExists(articleUri)) {
@@ -847,6 +1041,7 @@ export function activate(context: vscode.ExtensionContext): void {
     await articleRepository.deleteById(target.id);
     await syncArticleCollectionWithDisk(articleRepository, articleCollectionProvider);
     articleCollectionProvider.refresh();
+    clearSuggestionCache(target.styleId);
 
     if (fileDeleted) {
       notifyInfo(`已删除文集文章：${target.title}`);
@@ -903,84 +1098,12 @@ export function activate(context: vscode.ExtensionContext): void {
       active ? materialRepository.search(active.id, { semantic: editor.document.getText().slice(0, 120), limit: 5 }) : [],
       'article'
     );
-    const executionChannel = resolveAiExecutionChannel();
-    if (executionChannel === 'ide-chat') {
-      const dispatched = await dispatchPromptToIdeChat(prompt);
-      if (dispatched) {
-        notifyInfo('已将续写提示词填充到 IDE Chat。');
-      } else {
-        notifyWarn('当前宿主不支持自动填充 Chat，提示词已复制到剪贴板。');
-      }
-      return;
+    const dispatched = await dispatchPromptToIdeChat(prompt);
+    if (dispatched) {
+      notifyInfo('已将续写提示词填充到 IDE Chat 输入框。');
+    } else {
+      notifyWarn('未能自动填充到 IDE Chat 输入框，提示词已复制到剪贴板。');
     }
-
-    const settings = await resolveApiSettings(context);
-    if (settings?.enabled && settings.apiKey) {
-      try {
-        const result = await generateWithFallbackModel(settings, prompt);
-        const parsed = parseAiArticle(result.content);
-        await appendGeneratedDraftToEnd(
-          editor,
-          parsed.body,
-          parsed.conclusion,
-          style,
-          topic,
-          `${PROVIDER_PRESETS[settings.provider].displayName} API · ${result.model}`
-        );
-        if (result.fallbackUsed && result.fallbackFromModel) {
-          notifyWarn(
-            `当前模型“${result.fallbackFromModel}”不受支持，已自动改用“${result.model}”。`
-          );
-        }
-        notifyInfo('已通过 API 写入当前文稿末尾。');
-        return;
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        console.error('[writing-agent] API 续写失败，改用本地续写', message);
-        notifyWarn(`API 续写失败，已回退本地续写：${message}`);
-        const action = await vscode.window.showWarningMessage(
-          'API 续写失败，是否改用 IDE AI 对话并自动填充提示词？',
-          '改用 IDE AI 对话',
-          '继续本地续写'
-        );
-        if (action === '改用 IDE AI 对话') {
-          const dispatched = await dispatchPromptToIdeChat(prompt);
-          if (dispatched) {
-            notifyInfo('已改用 IDE Chat，请在聊天中继续生成并回填文稿。');
-          } else {
-            notifyWarn('无法自动填充 IDE Chat，提示词已复制到剪贴板。');
-          }
-          return;
-        }
-      }
-    } else if (settings?.enabled) {
-      const action = await vscode.window.showWarningMessage(
-        '未配置 API Key。是否改用 IDE AI 对话，或现在配置 API？',
-        '改用 IDE AI 对话',
-        '配置 API'
-      );
-      if (action === '改用 IDE AI 对话') {
-        const dispatched = await dispatchPromptToIdeChat(prompt);
-        if (dispatched) {
-          notifyInfo('已将续写提示词填充到 IDE Chat。');
-        } else {
-          notifyWarn('无法自动填充 IDE Chat，提示词已复制到剪贴板。');
-        }
-        return;
-      }
-      if (action === '配置 API') {
-        await vscode.commands.executeCommand('writingAgent.configureApi');
-      }
-    }
-
-    const fallback = generateStyleAlignedDraft(
-      topic,
-      style,
-      active ? materialRepository.search(active.id, { semantic: topic, limit: 8 }) : []
-    );
-    await appendGeneratedDraftToEnd(editor, fallback.body, fallback.conclusion, style, topic, '本地续写');
-    await vscode.env.clipboard.writeText(prompt);
-    notifyInfo('已回退本地续写，并复制提示词供手动使用。');
   });
 
   registerSafeCommand(context, 'writingAgent.rewriteSelectionWithIFlow', async () => {
@@ -1233,6 +1356,34 @@ export function activate(context: vscode.ExtensionContext): void {
   };
   registerSafeCommand(context, 'writingAgent.configureApi', configureApiHandler);
   registerSafeCommand(context, 'writingAgent.configureIFlowApi', configureApiHandler);
+  registerSafeCommand(context, 'writingAgent.configureSuggestionMinChars', async () => {
+    const config = vscode.workspace.getConfiguration('writingAgent');
+    const target = getConfigurationTarget();
+    const current = getSuggestionMinChars();
+    const input = await vscode.window.showInputBox({
+      title: '自动补全最小触发字符数',
+      prompt: '请输入 2~20 之间的整数',
+      value: String(current),
+      validateInput: value => {
+        const trimmed = value.trim();
+        if (!/^\d+$/.test(trimmed)) {
+          return '请输入整数';
+        }
+        const parsed = Number(trimmed);
+        if (parsed < 2 || parsed > 20) {
+          return '取值范围为 2~20';
+        }
+        return undefined;
+      }
+    });
+    if (input === undefined) {
+      return;
+    }
+    const parsed = Number(input.trim());
+    const nextValue = Math.min(20, Math.max(2, Math.round(parsed)));
+    await config.update('suggestionMinChars', nextValue, target);
+    notifyInfo(`自动补全最小触发字符数已设置为 ${nextValue}。`);
+  });
 
   registerSafeCommand(context, 'writingAgent.testApiConnection', async () => {
     const settings = await resolveApiSettings(context);
@@ -1277,6 +1428,10 @@ export function activate(context: vscode.ExtensionContext): void {
 
     const topic = editor.document.fileName.split('/').pop()?.replace(/\.md$/i, '') || '当前主题';
     await applyAiResultToDraft(editor, clipboard, style, topic);
+    const activeProfileId = styleRepository.getActiveProfileId();
+    if (activeProfileId) {
+      clearSuggestionCache(activeProfileId);
+    }
     notifyInfo('已将剪贴板内容写入当前文稿。');
   });
 
@@ -1323,7 +1478,70 @@ export function activate(context: vscode.ExtensionContext): void {
   });
 
   registerSafeCommand(context, 'writingAgent.refreshStyleProfile', async () => {
-    styleProfileProvider.refresh();
+    const active = styleRepository.getActiveProfile();
+    if (!active) {
+      styleProfileProvider.refresh();
+      notifyWarn('当前未激活风格，无法刷新风格特征。');
+      return;
+    }
+
+    await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: `正在刷新风格「${active.name}」...`,
+        cancellable: false
+      },
+      async progress => {
+        progress.report({ increment: 5, message: '同步文集索引...' });
+        const indexSync = await syncStyleArticleIndexFromDisk(active, articleRepository);
+
+        progress.report({ increment: 15, message: '读取当前风格素材...' });
+        const materialTexts = materialRepository.getAll(active.id)
+          .map(material => normalizeStyleAnalysisText(material.content))
+          .filter(text => isMeaningfulSuggestionText(text, 8));
+
+        progress.report({ increment: 30, message: '读取当前风格文集...' });
+        const articleTexts: string[] = [];
+        const styleArticles = articleRepository.listByStyle(active.id);
+        for (const record of styleArticles) {
+          const articleUri = resolveArticleUriByRelativePath(record.relativePath);
+          if (!articleUri) {
+            continue;
+          }
+          const articleText = normalizeStyleAnalysisText(await readTextFromUriSafely(articleUri));
+          if (!isMeaningfulSuggestionText(articleText, 24)) {
+            continue;
+          }
+          articleTexts.push(articleText);
+        }
+
+        const corpusBlocks = [...articleTexts, ...materialTexts];
+        if (corpusBlocks.length === 0) {
+          throw new Error('当前风格缺少可分析内容，请先导入样本或生成文稿。');
+        }
+
+        progress.report({ increment: 35, message: '重算风格维度...' });
+        const corpus = corpusBlocks.join('\n\n');
+        const refreshedStyle = await styleEngine.analyzeText(corpus);
+
+        progress.report({ increment: 10, message: '写入风格档案...' });
+        const updated = await styleRepository.refreshProfileStyle(
+          active.id,
+          refreshedStyle,
+          `refresh:materials(${materialTexts.length})+articles(${articleTexts.length})`
+        );
+        styleEngine.setCurrentStyle(updated.style);
+        styleProfileProvider.refresh();
+        materialLibraryProvider.refresh();
+        articleCollectionProvider.refresh();
+        clearSuggestionCache(active.id);
+
+        progress.report({ increment: 5, message: '完成' });
+        notifyInfo(
+          `风格已刷新：文集 ${articleTexts.length} 篇、素材 ${materialTexts.length} 条（索引补齐 ${indexSync.indexedRecords} 条）。`
+        );
+      }
+    );
   });
 }
 
@@ -1384,16 +1602,24 @@ async function dispatchPromptToIdeChat(prompt: string): Promise<boolean> {
 
   const commandSet = new Set(await vscode.commands.getCommands(true));
   const promptAttempts: Array<{ command: string; args: unknown }> = [
+    { command: 'workbench.action.chat.open', args: { query: normalized, isPartialQuery: true } },
     { command: 'workbench.action.chat.open', args: { query: normalized } },
     { command: 'workbench.action.chat.open', args: { inputValue: normalized } },
     { command: 'workbench.action.chat.open', args: { initialQuery: normalized } },
-    { command: 'workbench.action.chat.open', args: normalized },
+    { command: 'workbench.action.quickchat.open', args: { query: normalized } },
+    { command: 'workbench.action.quickchat.open', args: normalized },
     { command: 'vscode.chat.open', args: { query: normalized } },
-    { command: 'cursor.chat.new', args: normalized },
-    { command: 'cursor.chat.open', args: normalized },
+    { command: 'vscode.chat.open', args: { inputValue: normalized } },
+    { command: 'cursor.chat.new', args: { query: normalized } },
+    { command: 'cursor.chat.open', args: { query: normalized } },
     { command: 'codearts.agent.chat.open', args: { query: normalized } },
-    { command: 'codearts.chat.open', args: { query: normalized } }
+    { command: 'codearts.agent.chat.open', args: { inputValue: normalized } },
+    { command: 'codearts.agent.chat.new', args: { query: normalized } },
+    { command: 'codearts.chat.open', args: { query: normalized } },
+    { command: 'codearts.chat.open', args: { inputValue: normalized } },
+    { command: 'codearts.chat.new', args: { query: normalized } }
   ];
+  let opened = false;
 
   for (const attempt of promptAttempts) {
     if (!commandSet.has(attempt.command)) {
@@ -1401,27 +1627,61 @@ async function dispatchPromptToIdeChat(prompt: string): Promise<boolean> {
     }
     try {
       await vscode.commands.executeCommand(attempt.command, attempt.args);
-      return true;
+      opened = true;
     } catch {
       // 尝试下一种宿主命令。
     }
   }
 
   const focusAttempts = [
+    'workbench.action.chat.focusInput',
     'workbench.panel.chat.view.focus',
     'workbench.action.chat.open',
+    'workbench.action.quickchat.open',
+    'cursor.chat.focusInput',
     'cursor.chat.open',
-    'codearts.agent.chat.open'
+    'codearts.agent.chat.focusInput',
+    'codearts.agent.chat.open',
+    'codearts.chat.focusInput',
+    'codearts.chat.open'
   ];
+  let focused = false;
   for (const command of focusAttempts) {
     if (!commandSet.has(command)) {
       continue;
     }
     try {
       await vscode.commands.executeCommand(command);
+      focused = true;
       break;
     } catch {
       // 忽略聚焦失败，最终至少回退剪贴板。
+    }
+  }
+
+  if (opened || focused) {
+    const insertAttempts: Array<{ command: string; args: unknown }> = [
+      { command: 'workbench.action.chat.insert', args: { text: normalized } },
+      { command: 'workbench.action.chat.insert', args: normalized },
+      { command: 'cursor.chat.insert', args: { text: normalized } },
+      { command: 'cursor.chat.insert', args: normalized },
+      { command: 'codearts.agent.chat.insert', args: { text: normalized } },
+      { command: 'codearts.agent.chat.insert', args: normalized },
+      { command: 'codearts.chat.insert', args: { text: normalized } },
+      { command: 'codearts.chat.insert', args: normalized },
+      { command: 'workbench.action.quickchat.open', args: { query: normalized } },
+      { command: 'workbench.action.quickchat.open', args: normalized }
+    ];
+    for (const attempt of insertAttempts) {
+      if (!commandSet.has(attempt.command)) {
+        continue;
+      }
+      try {
+        await vscode.commands.executeCommand(attempt.command, attempt.args);
+        return true;
+      } catch {
+        // 回退到剪贴板。
+      }
     }
   }
 
@@ -1429,21 +1689,497 @@ async function dispatchPromptToIdeChat(prompt: string): Promise<boolean> {
   return false;
 }
 
+async function migrateLegacyCollectionDirectory(articleRepository: ArticleRepository): Promise<void> {
+  const roots = collectArticleSearchRoots();
+  let movedRoots = 0;
+  for (const root of roots) {
+    const legacyDir = joinUriByRelativePath(root, LEGACY_COLLECTION_RELATIVE_PREFIX);
+    const currentDir = joinUriByRelativePath(root, COLLECTION_RELATIVE_PREFIX);
+    if (!(await uriExists(legacyDir))) {
+      continue;
+    }
+
+    if (!(await uriExists(currentDir))) {
+      await vscode.workspace.fs.rename(legacyDir, currentDir, { overwrite: false });
+      movedRoots += 1;
+      continue;
+    }
+
+    const legacyFiles = await listFilesRecursive(legacyDir);
+    for (const source of legacyFiles) {
+      const relative = source.path.slice(legacyDir.path.length).replace(/^\/+/, '');
+      const target = vscode.Uri.joinPath(currentDir, ...relative.split('/'));
+      if (await uriExists(target)) {
+        continue;
+      }
+      await vscode.workspace.fs.createDirectory(getParentUri(target));
+      await vscode.workspace.fs.rename(source, target, { overwrite: false });
+    }
+  }
+
+  const rewritten = await articleRepository.replacePathPrefix(
+    `${LEGACY_COLLECTION_RELATIVE_PREFIX}/`,
+    `${COLLECTION_RELATIVE_PREFIX}/`
+  );
+  if (movedRoots > 0 || rewritten > 0) {
+    notifyInfo(`已兼容迁移旧版文集目录（目录迁移 ${movedRoots} 个，索引更新 ${rewritten} 条）。`);
+  }
+}
+
 async function syncArticleCollectionWithDisk(
   articleRepository: ArticleRepository,
   articleCollectionProvider: ArticleCollectionProvider,
   options?: { notifyOnCleanup?: boolean }
 ): Promise<void> {
-  const root = getPrimaryWorkspaceRootUri();
-  if (!root) {
-    return;
-  }
-  const result = await articleRepository.pruneMissingFiles(root);
+  const roots = collectArticleSearchRoots();
+  const result = await articleRepository.pruneMissingFiles(roots);
   if (result.removed > 0) {
     articleCollectionProvider.refresh();
     if (options?.notifyOnCleanup) {
       notifyInfo(`文集已清理 ${result.removed} 条失效索引。`);
     }
+  }
+}
+
+async function sedimentCurrentStyleArticlesToMaterials(
+  activeProfile: StyleProfile,
+  articleRepository: ArticleRepository,
+  materialExtractor: MaterialExtractor,
+  materialRepository: MaterialRepository
+): Promise<MaterialSedimentationResult> {
+  const directRecords = articleRepository.listByStyle(activeProfile.id);
+  const fallbackRecords = directRecords.length > 0
+    ? []
+    : articleRepository.listAll().filter(record => record.styleName === activeProfile.name);
+  const records = [...directRecords, ...fallbackRecords];
+  const seenPaths = new Set<string>();
+  let processedArticles = 0;
+  let addedMaterials = 0;
+
+  for (const record of records) {
+    const normalizedPath = normalizeRelativePath(record.relativePath);
+    if (!normalizedPath || seenPaths.has(normalizedPath)) {
+      continue;
+    }
+    seenPaths.add(normalizedPath);
+
+    const articleUri = resolveArticleUriByRelativePath(record.relativePath);
+    if (!articleUri) {
+      continue;
+    }
+
+    const articleText = await readTextFromUriSafely(articleUri);
+    const extractableText = normalizeArticleForMaterialExtraction(articleText);
+    if (!isMeaningfulSuggestionText(extractableText, 24)) {
+      continue;
+    }
+
+    const extracted = await materialExtractor.extractMaterials(
+      extractableText,
+      articleUri.fsPath || articleUri.toString()
+    );
+    if (extracted.length === 0) {
+      continue;
+    }
+    processedArticles += 1;
+    addedMaterials += await materialRepository.addMany(activeProfile.id, extracted);
+  }
+
+  return { processedArticles, addedMaterials };
+}
+
+async function syncStyleArticleIndexFromDisk(
+  activeProfile: StyleProfile,
+  articleRepository: ArticleRepository
+): Promise<StyleArticleIndexSyncResult> {
+  const styleDirName = sanitizePathSegment(activeProfile.name);
+  const roots = collectArticleSearchRoots();
+  const allRecords = articleRepository.listAll();
+  const recordByPath = new Map<string, ArticleRecord>();
+  for (const record of allRecords) {
+    const normalized = normalizeRelativePath(toCanonicalCollectionRelativePath(record.relativePath));
+    if (!normalized || recordByPath.has(normalized)) {
+      continue;
+    }
+    recordByPath.set(normalized, record);
+  }
+
+  let indexedRecords = 0;
+  let scannedFiles = 0;
+  const visited = new Set<string>();
+
+  for (const root of roots) {
+    for (const collectionPrefix of getCollectionRelativePrefixes()) {
+      const styleDir = joinUriByRelativePath(root, `${collectionPrefix}/${styleDirName}`);
+      const markdownFiles = await listMarkdownFilesRecursive(styleDir);
+      scannedFiles += markdownFiles.length;
+
+      for (const file of markdownFiles) {
+        const relativePath = file.path.replace(root.path, '').replace(/^\/+/, '');
+        const normalized = normalizeRelativePath(toCanonicalCollectionRelativePath(relativePath));
+        if (!normalized || visited.has(normalized)) {
+          continue;
+        }
+        visited.add(normalized);
+
+        const existing = recordByPath.get(normalized);
+        const title = path.basename(file.path).replace(/\.md$/i, '');
+        const topic = deriveTopicFromArticleTitle(title);
+        if (existing && existing.styleId === activeProfile.id && existing.styleName === activeProfile.name) {
+          continue;
+        }
+
+        await articleRepository.upsert({
+          id: existing?.id,
+          topic,
+          title,
+          styleId: activeProfile.id,
+          styleName: activeProfile.name,
+          relativePath,
+          aiCommand: existing?.aiCommand
+        });
+        indexedRecords += 1;
+      }
+    }
+  }
+
+  return { indexedRecords, scannedFiles };
+}
+
+function scheduleSuggestionTrigger(
+  event: vscode.TextDocumentChangeEvent,
+  timers: Map<string, NodeJS.Timeout>
+): void {
+  const editor = vscode.window.activeTextEditor;
+  if (!editor || editor.document.uri.toString() !== event.document.uri.toString()) {
+    return;
+  }
+  if (!isSuggestableDocument(event.document)) {
+    return;
+  }
+  if (event.contentChanges.length === 0) {
+    return;
+  }
+
+  const latestChange = event.contentChanges[event.contentChanges.length - 1];
+  const changedText = latestChange.text || '';
+  if (!/[\p{L}\p{N}\u4E00-\u9FFF]/u.test(changedText) && !/[，。！？,.!?；;:：、]/u.test(changedText)) {
+    return;
+  }
+
+  const key = event.document.uri.toString();
+  const existing = timers.get(key);
+  if (existing) {
+    clearTimeout(existing);
+  }
+
+  const timer = setTimeout(() => {
+    timers.delete(key);
+    const activeEditor = vscode.window.activeTextEditor;
+    if (!activeEditor || activeEditor.document.uri.toString() !== key) {
+      return;
+    }
+    void vscode.commands.executeCommand('editor.action.triggerSuggest');
+  }, getSuggestionDelayMs());
+  timers.set(key, timer);
+}
+
+async function collectCompletionSuggestions(
+  query: string,
+  styleRepository: StyleRepository,
+  materialRepository: MaterialRepository,
+  articleRepository: ArticleRepository,
+  cache: Map<string, SuggestionBucketCache>
+): Promise<SuggestionCandidate[]> {
+  const profiles = styleRepository.listProfiles();
+  if (profiles.length === 0) {
+    return [];
+  }
+
+  const activeStyleId = styleRepository.getActiveProfileId();
+  const orderedProfiles = activeStyleId
+    ? [
+      ...profiles.filter(profile => profile.id === activeStyleId),
+      ...profiles.filter(profile => profile.id !== activeStyleId)
+    ]
+    : profiles;
+
+  const now = Date.now();
+  const pool: SuggestionCandidate[] = [];
+  for (const profile of orderedProfiles) {
+    const cached = cache.get(profile.id);
+    if (cached && now - cached.builtAt <= SUGGESTION_CACHE_TTL_MS) {
+      pool.push(...cached.items);
+      continue;
+    }
+
+    const bucket = await buildSuggestionBucketForStyle(
+      profile,
+      profile.id === activeStyleId,
+      materialRepository,
+      articleRepository
+    );
+    cache.set(profile.id, { items: bucket, builtAt: now });
+    pool.push(...bucket);
+  }
+
+  const dedup = new Set<string>();
+  const scored: Array<{ candidate: SuggestionCandidate; score: number }> = [];
+  for (const candidate of pool) {
+    const key = `${candidate.styleId}|${candidate.sourceType}|${candidate.text}`;
+    if (dedup.has(key)) {
+      continue;
+    }
+    dedup.add(key);
+
+    const score = scoreSuggestionCandidate(query, candidate);
+    if (score <= 0) {
+      continue;
+    }
+    scored.push({ candidate, score });
+  }
+
+  return scored
+    .sort((left, right) => {
+      if (right.score !== left.score) {
+        return right.score - left.score;
+      }
+      if (right.candidate.quality !== left.candidate.quality) {
+        return right.candidate.quality - left.candidate.quality;
+      }
+      return left.candidate.text.length - right.candidate.text.length;
+    })
+    .slice(0, COMPLETION_MAX_ITEMS)
+    .map(entry => entry.candidate);
+}
+
+function resolveSuggestionReplaceRange(
+  document: vscode.TextDocument,
+  position: vscode.Position,
+  query: string
+): vscode.Range | undefined {
+  if (!query) {
+    return undefined;
+  }
+  const linePrefix = document.lineAt(position.line).text.slice(0, position.character);
+  const tokenStart = findSuggestionTokenStart(linePrefix);
+  if (tokenStart >= position.character) {
+    return undefined;
+  }
+  return new vscode.Range(new vscode.Position(position.line, tokenStart), position);
+}
+
+function createCompletionItem(
+  candidate: SuggestionCandidate,
+  index: number,
+  replaceRange?: vscode.Range
+): vscode.CompletionItem {
+  const item = new vscode.CompletionItem(
+    summarizeSuggestionLabel(candidate.text),
+    vscode.CompletionItemKind.Snippet
+  );
+  item.insertText = candidate.text;
+  item.filterText = candidate.text;
+  item.sortText = `${index}`.padStart(2, '0');
+  item.preselect = index === 0;
+  item.detail = `${candidate.isCurrentStyle ? '当前风格' : '其他风格'} · ${candidate.styleName} · ${candidate.sourceType === 'material' ? '素材库' : '文集'}`;
+  if (replaceRange) {
+    item.range = replaceRange;
+  }
+  return item;
+}
+
+function extractSuggestionQuery(linePrefix: string): string {
+  const tail = linePrefix.slice(-80).replace(/\t/g, ' ');
+  const matched = tail.match(/[\p{L}\p{N}\u4E00-\u9FFF_-]{2,}$/u);
+  if (!matched) {
+    return '';
+  }
+  return matched[0].trim().slice(-24);
+}
+
+function findSuggestionTokenStart(linePrefix: string): number {
+  let index = linePrefix.length;
+  while (index > 0) {
+    const prevChar = linePrefix[index - 1];
+    if (/[\s,，。！？!?；;:：、()[\]{}<>《》【】“”"‘’'`~|\\/]/u.test(prevChar)) {
+      break;
+    }
+    index -= 1;
+  }
+  return index;
+}
+
+function getSuggestionDelayMs(): number {
+  const rawDelay = vscode.workspace.getConfiguration('writingAgent').get<number>('suggestionDelay', 500);
+  if (!Number.isFinite(rawDelay)) {
+    return 500;
+  }
+  return Math.min(2500, Math.max(80, Math.round(rawDelay)));
+}
+
+function getSuggestionMinChars(): number {
+  const rawMinChars = vscode.workspace.getConfiguration('writingAgent').get<number>('suggestionMinChars', 6);
+  if (!Number.isFinite(rawMinChars)) {
+    return 6;
+  }
+  return Math.min(20, Math.max(2, Math.round(rawMinChars)));
+}
+
+function isSuggestableDocument(document: vscode.TextDocument): boolean {
+  if (document.isUntitled) {
+    return document.languageId === 'markdown' || document.languageId === 'plaintext';
+  }
+  return document.uri.scheme === 'file' && (document.languageId === 'markdown' || document.languageId === 'plaintext');
+}
+
+async function buildSuggestionBucketForStyle(
+  profile: StyleProfile,
+  isCurrentStyle: boolean,
+  materialRepository: MaterialRepository,
+  articleRepository: ArticleRepository
+): Promise<SuggestionCandidate[]> {
+  const candidates: SuggestionCandidate[] = [];
+  const seen = new Set<string>();
+  const addCandidate = (text: string, sourceType: SuggestionSourceType, quality: number): void => {
+    const normalized = normalizeSuggestionText(text);
+    if (!isMeaningfulSuggestionText(normalized, 8)) {
+      return;
+    }
+    const dedupKey = `${sourceType}|${normalized}`;
+    if (seen.has(dedupKey)) {
+      return;
+    }
+    seen.add(dedupKey);
+    candidates.push({
+      text: normalized,
+      styleId: profile.id,
+      styleName: profile.name,
+      sourceType,
+      isCurrentStyle,
+      quality
+    });
+  };
+
+  const styleMaterials = materialRepository.search(profile.id, { limit: 120 });
+  for (const material of styleMaterials) {
+    addCandidate(material.content, 'material', material.metadata.quality || material.features.quality || 60);
+  }
+
+  const styleArticles = articleRepository.listByStyle(profile.id).slice(0, 30);
+  for (const article of styleArticles) {
+    addCandidate(article.topic, 'article', 62);
+    addCandidate(article.title, 'article', 62);
+  }
+
+  const styleFavoriteWords = filterMeaningfulAnalysisWords(profile.style.vocabulary?.favoriteWords || []).slice(0, 24);
+  for (const word of styleFavoriteWords) {
+    addCandidate(word, 'article', 58);
+  }
+
+  return candidates.slice(0, 260);
+}
+
+function normalizeSuggestionText(text: string): string {
+  return (text || '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\t/g, ' ')
+    .replace(/\n+/g, ' ')
+    .replace(/[ ]{2,}/g, ' ')
+    .trim();
+}
+
+function isMeaningfulSuggestionText(text: string, minCoreChars: number): boolean {
+  if (!text) {
+    return false;
+  }
+  const compact = text.replace(/\s+/g, '');
+  if (!compact) {
+    return false;
+  }
+  if (/^[-_*`#>~|]+$/.test(compact)) {
+    return false;
+  }
+  const core = compact.replace(/[^\p{L}\p{N}\u4E00-\u9FFF]/gu, '');
+  return core.length >= minCoreChars;
+}
+
+function scoreSuggestionCandidate(query: string, candidate: SuggestionCandidate): number {
+  const normalizedQuery = normalizeQueryToken(query);
+  if (!normalizedQuery) {
+    return 0;
+  }
+  const normalizedText = normalizeQueryToken(candidate.text);
+  if (!normalizedText) {
+    return 0;
+  }
+
+  let score = 0;
+  if (normalizedText.startsWith(normalizedQuery)) {
+    score += 120;
+  } else if (normalizedText.includes(normalizedQuery)) {
+    score += 80;
+  }
+
+  const tokens = normalizedQuery.split(/\s+/).filter(Boolean);
+  if (tokens.length > 1) {
+    let hit = 0;
+    for (const token of tokens) {
+      if (normalizedText.includes(token)) {
+        hit += 1;
+      }
+    }
+    if (hit === tokens.length) {
+      score += 28;
+    } else if (hit > 0) {
+      score += 12;
+    }
+  }
+
+  score += candidate.isCurrentStyle ? 1000 : 300;
+  score += candidate.sourceType === 'material' ? 20 : 12;
+  score += Math.min(candidate.quality, 100) / 10;
+  return score;
+}
+
+function normalizeQueryToken(value: string): string {
+  return (value || '').toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+function summarizeSuggestionLabel(text: string): string {
+  if (text.length <= 36) {
+    return text;
+  }
+  return `${text.slice(0, 36)}…`;
+}
+
+function normalizeArticleForMaterialExtraction(text: string): string {
+  return (text || '')
+    .replace(/\r\n/g, '\n')
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/^[-*_]{3,}\s*$/gm, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function normalizeStyleAnalysisText(text: string): string {
+  return (text || '')
+    .replace(/\r\n/g, '\n')
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/^[-*_]{3,}\s*$/gm, '')
+    .replace(/^#{1,6}\s+/gm, '')
+    .replace(/^>\s+/gm, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .replace(/[ \t]{2,}/g, ' ')
+    .trim();
+}
+
+async function readTextFromUriSafely(uri: vscode.Uri): Promise<string> {
+  try {
+    const buffer = await vscode.workspace.fs.readFile(uri);
+    return Buffer.from(buffer).toString('utf8');
+  } catch {
+    return '';
   }
 }
 
@@ -1512,6 +2248,53 @@ async function listSupportedDocsRecursive(dir: vscode.Uri): Promise<vscode.Uri[]
   return files;
 }
 
+async function listFilesRecursive(dir: vscode.Uri): Promise<vscode.Uri[]> {
+  const files: vscode.Uri[] = [];
+  let entries: [string, vscode.FileType][];
+  try {
+    entries = await vscode.workspace.fs.readDirectory(dir);
+  } catch {
+    return files;
+  }
+
+  for (const [name, fileType] of entries) {
+    const target = vscode.Uri.joinPath(dir, name);
+    if (fileType === vscode.FileType.File) {
+      files.push(target);
+      continue;
+    }
+    if (fileType === vscode.FileType.Directory) {
+      files.push(...await listFilesRecursive(target));
+    }
+  }
+  return files;
+}
+
+async function listMarkdownFilesRecursive(dir: vscode.Uri): Promise<vscode.Uri[]> {
+  const files: vscode.Uri[] = [];
+  let entries: [string, vscode.FileType][];
+  try {
+    entries = await vscode.workspace.fs.readDirectory(dir);
+  } catch {
+    return files;
+  }
+
+  for (const [name, fileType] of entries) {
+    const target = vscode.Uri.joinPath(dir, name);
+    if (fileType === vscode.FileType.File) {
+      if (/\.md$/i.test(name)) {
+        files.push(target);
+      }
+      continue;
+    }
+    if (fileType === vscode.FileType.Directory) {
+      files.push(...await listMarkdownFilesRecursive(target));
+    }
+  }
+
+  return files;
+}
+
 function isSupportedImportDocument(uri: vscode.Uri): boolean {
   const lowerPath = uri.path.toLowerCase();
   return (
@@ -1547,12 +2330,35 @@ function decodeTextBuffer(buffer: Buffer): string {
 }
 
 async function extractTextFromDocx(buffer: Buffer): Promise<string> {
+  const mammothModule = loadMammothModule();
+  if (!mammothModule) {
+    throw new Error('DOCX 解析组件不可用，请重新安装插件后重试');
+  }
+
   try {
-    const result = await mammoth.extractRawText({ buffer });
+    const result = await mammothModule.extractRawText({ buffer });
     return result.value || '';
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     throw new Error(`DOCX 解析失败：${message}`);
+  }
+}
+
+function loadMammothModule(): MammothModule | null {
+  if (cachedMammothModule !== undefined) {
+    return cachedMammothModule;
+  }
+
+  try {
+    // 延迟加载可选依赖，避免宿主环境缺包时阻断插件激活。
+    // eslint-disable-next-line @typescript-eslint/no-var-requires, global-require
+    cachedMammothModule = require('mammoth') as MammothModule;
+    return cachedMammothModule;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`[writing-agent] mammoth 加载失败：${message}`);
+    cachedMammothModule = null;
+    return null;
   }
 }
 
@@ -1688,6 +2494,134 @@ function getPrimaryWorkspaceRootUri(): vscode.Uri | null {
   return folders[0].uri;
 }
 
+function resolveStorageRootPath(): string {
+  const config = vscode.workspace.getConfiguration('writingAgent');
+  const configured = (config.get<string>('storage.path', '') || '').trim();
+  if (!configured) {
+    return path.join(os.homedir(), 'Downloads', STORAGE_DEFAULT_DIR_NAME);
+  }
+
+  const homeExpanded = configured.startsWith('~')
+    ? path.join(os.homedir(), configured.slice(1))
+    : configured;
+  return path.resolve(homeExpanded);
+}
+
+function resolveStorageRootUri(): vscode.Uri {
+  return vscode.Uri.file(resolveStorageRootPath());
+}
+
+function resolveStorageDataUri(): vscode.Uri {
+  return vscode.Uri.joinPath(resolveStorageRootUri(), STORAGE_DATA_RELATIVE_PREFIX);
+}
+
+async function ensureStorageDirectories(): Promise<void> {
+  const root = resolveStorageRootUri();
+  await vscode.workspace.fs.createDirectory(root);
+  await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(root, COLLECTION_RELATIVE_PREFIX));
+  await vscode.workspace.fs.createDirectory(resolveStorageDataUri());
+}
+
+function collectArticleSearchRoots(): vscode.Uri[] {
+  const roots: vscode.Uri[] = [resolveStorageRootUri()];
+  const workspaceRoot = getPrimaryWorkspaceRootUri();
+  if (workspaceRoot && workspaceRoot.path !== roots[0].path) {
+    roots.push(workspaceRoot);
+  }
+  return roots;
+}
+
+function getCollectionRelativePrefixes(): string[] {
+  return [COLLECTION_RELATIVE_PREFIX, LEGACY_COLLECTION_RELATIVE_PREFIX];
+}
+
+function splitRelativePathSegments(relativePath: string): string[] {
+  return (relativePath || '')
+    .replace(/^\/+/, '')
+    .replace(/\\/g, '/')
+    .split('/')
+    .filter(Boolean);
+}
+
+function joinUriByRelativePath(root: vscode.Uri, relativePath: string): vscode.Uri {
+  const segments = splitRelativePathSegments(relativePath);
+  return segments.length > 0 ? vscode.Uri.joinPath(root, ...segments) : root;
+}
+
+function toCanonicalCollectionRelativePath(relativePath: string): string {
+  const normalized = splitRelativePathSegments(relativePath).join('/');
+  if (!normalized) {
+    return '';
+  }
+  const legacyPrefix = `${LEGACY_COLLECTION_RELATIVE_PREFIX}/`;
+  if (normalized.startsWith(legacyPrefix)) {
+    return `${COLLECTION_RELATIVE_PREFIX}/${normalized.slice(legacyPrefix.length)}`;
+  }
+  return normalized;
+}
+
+function getCollectionRelativePathCandidates(relativePath: string): string[] {
+  const normalized = splitRelativePathSegments(relativePath).join('/');
+  if (!normalized) {
+    return [];
+  }
+  const currentPrefix = `${COLLECTION_RELATIVE_PREFIX}/`;
+  const legacyPrefix = `${LEGACY_COLLECTION_RELATIVE_PREFIX}/`;
+  if (normalized.startsWith(currentPrefix)) {
+    const suffix = normalized.slice(currentPrefix.length);
+    return [normalized, `${LEGACY_COLLECTION_RELATIVE_PREFIX}/${suffix}`];
+  }
+  if (normalized.startsWith(legacyPrefix)) {
+    const suffix = normalized.slice(legacyPrefix.length);
+    return [normalized, `${COLLECTION_RELATIVE_PREFIX}/${suffix}`];
+  }
+  return [normalized];
+}
+
+function resolveArticleUriByRelativePath(relativePath: string): vscode.Uri | null {
+  const relativePathCandidates = getCollectionRelativePathCandidates(relativePath);
+  if (relativePathCandidates.length === 0) {
+    return null;
+  }
+
+  const roots = collectArticleSearchRoots();
+  for (const root of roots) {
+    for (const candidateRelativePath of relativePathCandidates) {
+      const candidate = joinUriByRelativePath(root, candidateRelativePath);
+      if (candidate.scheme === 'file' && fs.existsSync(candidate.fsPath)) {
+        return candidate;
+      }
+    }
+  }
+  return joinUriByRelativePath(resolveStorageRootUri(), relativePathCandidates[0]);
+}
+
+async function resolveArticleUriForDelete(relativePath: string, preferredRoot: vscode.Uri): Promise<vscode.Uri> {
+  const relativePathCandidates = getCollectionRelativePathCandidates(relativePath);
+  if (relativePathCandidates.length === 0) {
+    return preferredRoot;
+  }
+
+  for (const candidateRelativePath of relativePathCandidates) {
+    const preferred = joinUriByRelativePath(preferredRoot, candidateRelativePath);
+    if (await uriExists(preferred)) {
+      return preferred;
+    }
+  }
+
+  const workspaceRoot = getPrimaryWorkspaceRootUri();
+  if (workspaceRoot && workspaceRoot.path !== preferredRoot.path) {
+    for (const candidateRelativePath of relativePathCandidates) {
+      const fallback = joinUriByRelativePath(workspaceRoot, candidateRelativePath);
+      if (await uriExists(fallback)) {
+        return fallback;
+      }
+    }
+  }
+
+  return joinUriByRelativePath(preferredRoot, relativePathCandidates[0]);
+}
+
 function getConfigurationTarget(): vscode.ConfigurationTarget {
   return vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0
     ? vscode.ConfigurationTarget.Workspace
@@ -1763,7 +2697,7 @@ async function resolveApiSettings(
       : preset.defaultModel
   );
   const temperature = config.get<number>('api.temperature', config.get<number>('iflow.temperature', 0.7));
-  const maxTokens = config.get<number>('api.maxTokens', config.get<number>('iflow.maxTokens', 2200));
+  const maxTokens = config.get<number>('api.maxTokens', config.get<number>('iflow.maxTokens', 10000));
   const timeoutMs = config.get<number>('api.timeoutMs', config.get<number>('iflow.timeoutMs', 60000));
 
   const providerSecret = ((await context.secrets.get(getProviderSecretKey(provider))) || '').trim();
@@ -1876,7 +2810,7 @@ async function validateApiConnection(
 async function removeArticlesByStyle(
   styleId: string,
   articleRepository: ArticleRepository,
-  workspaceRoot: vscode.Uri | null
+  storageRoot: vscode.Uri
 ): Promise<DeleteStyleArticlesResult> {
   const records = articleRepository.listByStyle(styleId);
   const result: DeleteStyleArticlesResult = {
@@ -1886,19 +2820,17 @@ async function removeArticlesByStyle(
   };
 
   for (const record of records) {
-    if (workspaceRoot) {
-      const articleUri = vscode.Uri.joinPath(workspaceRoot, ...record.relativePath.split('/'));
-      try {
-        if (await uriExists(articleUri)) {
-          await vscode.workspace.fs.delete(articleUri, { recursive: false, useTrash: false });
-          result.deletedFiles += 1;
-        } else {
-          result.missingFiles += 1;
-        }
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        console.error(`[writing-agent] 删除风格文章文件失败: ${record.relativePath}`, message);
+    const articleUri = await resolveArticleUriForDelete(record.relativePath, storageRoot);
+    try {
+      if (await uriExists(articleUri)) {
+        await vscode.workspace.fs.delete(articleUri, { recursive: false, useTrash: false });
+        result.deletedFiles += 1;
+      } else {
+        result.missingFiles += 1;
       }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`[writing-agent] 删除风格文章文件失败: ${record.relativePath}`, message);
     }
 
     const removed = await articleRepository.deleteById(record.id);
@@ -1913,7 +2845,7 @@ async function moveArticlesToStyle(
   sourceStyle: StyleProfile,
   targetStyle: StyleProfile,
   articleRepository: ArticleRepository,
-  workspaceRoot: vscode.Uri | null
+  storageRoot: vscode.Uri
 ): Promise<MergeStyleArticlesResult> {
   const records = articleRepository.listByStyle(sourceStyle.id);
   const result: MergeStyleArticlesResult = {
@@ -1923,38 +2855,32 @@ async function moveArticlesToStyle(
     missingFiles: 0
   };
 
-  const targetDir = workspaceRoot
-    ? vscode.Uri.joinPath(workspaceRoot, COLLECTION_RELATIVE_PREFIX, sanitizePathSegment(targetStyle.name))
-    : null;
-  if (targetDir) {
-    await vscode.workspace.fs.createDirectory(targetDir);
-  }
+  const targetDir = vscode.Uri.joinPath(storageRoot, COLLECTION_RELATIVE_PREFIX, sanitizePathSegment(targetStyle.name));
+  await vscode.workspace.fs.createDirectory(targetDir);
 
   for (const record of records) {
     let nextRelativePath = record.relativePath;
     let nextTitle = record.title;
 
-    if (workspaceRoot && targetDir) {
-      const sourceUri = vscode.Uri.joinPath(workspaceRoot, ...record.relativePath.split('/'));
-      try {
-        if (await uriExists(sourceUri)) {
-          const sourceName = sourceUri.path.slice(sourceUri.path.lastIndexOf('/') + 1);
-          const targetUri = vscode.Uri.joinPath(targetDir, sourceName);
-          const finalTarget = await ensureUniqueTargetUri(targetUri);
-          if (finalTarget.path !== targetUri.path) {
-            result.renamedFiles += 1;
-          }
-          await vscode.workspace.fs.rename(sourceUri, finalTarget, { overwrite: false });
-          nextRelativePath = finalTarget.path.replace(workspaceRoot.path, '').replace(/^\//, '');
-          nextTitle = finalTarget.path.slice(finalTarget.path.lastIndexOf('/') + 1).replace(/\.md$/i, '');
-          result.movedFiles += 1;
-        } else {
-          result.missingFiles += 1;
+    const sourceUri = await resolveArticleUriForDelete(record.relativePath, storageRoot);
+    try {
+      if (await uriExists(sourceUri)) {
+        const sourceName = sourceUri.path.slice(sourceUri.path.lastIndexOf('/') + 1);
+        const targetUri = vscode.Uri.joinPath(targetDir, sourceName);
+        const finalTarget = await ensureUniqueTargetUri(targetUri);
+        if (finalTarget.path !== targetUri.path) {
+          result.renamedFiles += 1;
         }
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        console.error(`[writing-agent] 迁移风格文章文件失败: ${record.relativePath}`, message);
+        await vscode.workspace.fs.rename(sourceUri, finalTarget, { overwrite: false });
+        nextRelativePath = finalTarget.path.replace(storageRoot.path, '').replace(/^\//, '');
+        nextTitle = finalTarget.path.slice(finalTarget.path.lastIndexOf('/') + 1).replace(/\.md$/i, '');
+        result.movedFiles += 1;
+      } else {
+        result.missingFiles += 1;
       }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`[writing-agent] 迁移风格文章文件失败: ${record.relativePath}`, message);
     }
 
     await articleRepository.upsert({
@@ -2011,67 +2937,6 @@ async function resolveArticleRecordTarget(
     return undefined;
   }
   return articleRepository.getById(picked.recordId);
-}
-
-async function migrateArticleCollectionToVisibleRoot(
-  articleRepository: ArticleRepository,
-  articleCollectionProvider: ArticleCollectionProvider
-): Promise<void> {
-  const root = getPrimaryWorkspaceRootUri();
-  if (!root) {
-    return;
-  }
-
-  const legacyDir = vscode.Uri.joinPath(root, ...LEGACY_COLLECTION_RELATIVE_PREFIX.split('/'));
-  const currentDir = vscode.Uri.joinPath(root, COLLECTION_RELATIVE_PREFIX);
-  const legacyExists = await uriExists(legacyDir);
-  if (!legacyExists) {
-    return;
-  }
-
-  try {
-    if (!(await uriExists(currentDir))) {
-      await vscode.workspace.fs.rename(legacyDir, currentDir, { overwrite: false });
-    } else {
-      const files = await listFilesRecursive(legacyDir);
-      for (const file of files) {
-        const relative = file.path.slice(legacyDir.path.length).replace(/^\/+/, '');
-        const target = vscode.Uri.joinPath(currentDir, ...relative.split('/'));
-        const finalTarget = await ensureUniqueTargetUri(target);
-        await vscode.workspace.fs.createDirectory(getParentUri(finalTarget));
-        await vscode.workspace.fs.rename(file, finalTarget, { overwrite: false });
-      }
-      await vscode.workspace.fs.delete(legacyDir, { recursive: true, useTrash: false });
-    }
-    const changed = await articleRepository.replacePathPrefix(
-      `${LEGACY_COLLECTION_RELATIVE_PREFIX}/`,
-      `${COLLECTION_RELATIVE_PREFIX}/`
-    );
-    if (changed > 0) {
-      articleCollectionProvider.refresh();
-      notifyInfo(`已迁移 ${changed} 篇文集记录到“${COLLECTION_RELATIVE_PREFIX}”目录。`);
-    }
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    console.error('[writing-agent] 文集迁移失败', message);
-    notifyWarn(`文集迁移失败：${message}`);
-  }
-}
-
-async function listFilesRecursive(dir: vscode.Uri): Promise<vscode.Uri[]> {
-  const files: vscode.Uri[] = [];
-  const entries = await vscode.workspace.fs.readDirectory(dir);
-  for (const [name, fileType] of entries) {
-    const target = vscode.Uri.joinPath(dir, name);
-    if (fileType === vscode.FileType.File) {
-      files.push(target);
-      continue;
-    }
-    if (fileType === vscode.FileType.Directory) {
-      files.push(...await listFilesRecursive(target));
-    }
-  }
-  return files;
 }
 
 async function ensureUniqueTargetUri(uri: vscode.Uri): Promise<vscode.Uri> {
@@ -2215,6 +3080,92 @@ function sanitizePathSegment(value: string): string {
     .replace(/-+/g, '-')
     .replace(/^-|-$/g, '')
     .slice(0, 60) || 'untitled';
+}
+
+function normalizeRelativePath(relativePath: string): string {
+  return (relativePath || '')
+    .replace(/^\/+/, '')
+    .replace(/\\/g, '/')
+    .replace(/\/+/g, '/')
+    .trim()
+    .toLowerCase();
+}
+
+function deriveTopicFromArticleTitle(title: string): string {
+  const normalized = (title || '').trim();
+  if (!normalized) {
+    return '未命名主题';
+  }
+  const withoutTimestamp = normalized.replace(/-\d{8}-\d{6}( \(\d+\))?$/u, '').trim();
+  return withoutTimestamp || normalized;
+}
+
+function buildMaterialExportMarkdown(styleName: string, materials: WritingMaterial[]): string {
+  const sorted = [...materials].sort((a, b) => b.metadata.updatedAt.getTime() - a.metadata.updatedAt.getTime());
+  const typeCounts = new Map<MaterialType, number>();
+  sorted.forEach(material => {
+    typeCounts.set(material.type, (typeCounts.get(material.type) || 0) + 1);
+  });
+
+  const summary = [...typeCounts.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .map(([type, count]) => `- ${getMaterialTypeName(type)}：${count} 条`)
+    .join('\n');
+  const blocks = sorted.map((material, index) => {
+    return [
+      `## ${index + 1}. ${material.name}`,
+      '',
+      `- 类型：${getMaterialTypeName(material.type)}`,
+      `- 质量：${material.metadata.quality}`,
+      `- 更新时间：${material.metadata.updatedAt.toLocaleString()}`,
+      `- 来源：${material.metadata.source}`,
+      `- 标签：${(material.tags || []).join('、') || '无'}`,
+      '',
+      '```text',
+      material.content,
+      '```',
+      ''
+    ].join('\n');
+  }).join('\n');
+
+  return [
+    `# 素材导出 · ${styleName || '未命名风格'}`,
+    '',
+    `- 导出时间：${new Date().toLocaleString()}`,
+    `- 导出数量：${sorted.length}`,
+    '',
+    '## 类型统计',
+    summary || '- 无',
+    '',
+    '## 素材列表',
+    '',
+    blocks
+  ].join('\n');
+}
+
+function getMaterialTypeName(type: MaterialType): string {
+  switch (type) {
+    case MaterialType.SENTENCE:
+      return '精彩句子';
+    case MaterialType.PARAGRAPH:
+      return '优秀段落';
+    case MaterialType.QUOTE:
+      return '引用名言';
+    case MaterialType.METAPHOR:
+      return '比喻修辞';
+    case MaterialType.OPENING:
+      return '文章开头';
+    case MaterialType.ENDING:
+      return '文章结尾';
+    case MaterialType.TRANSITION:
+      return '过渡表达';
+    case MaterialType.IDEA:
+      return '创意观点';
+    case MaterialType.STYLE_SAMPLE:
+      return '风格样本';
+    default:
+      return '其他';
+  }
 }
 
 function getParentUri(uri: vscode.Uri): vscode.Uri {
@@ -2787,85 +3738,245 @@ async function pickRewriteApplyModeWithPreview(
   return undefined;
 }
 
+function escapeHtml(value: string): string {
+  return (value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function formatPercent(value: number, digits = 1): string {
+  return `${(Math.max(0, Math.min(1, Number.isFinite(value) ? value : 0)) * 100).toFixed(digits)}%`;
+}
+
+function renderTags(words: string[]): string {
+  if (!words || words.length === 0) {
+    return '<span class="muted">暂无</span>';
+  }
+  return words.map(word => `<span class="tag">${escapeHtml(word)}</span>`).join('');
+}
+
+function filterMeaningfulAnalysisWords(words: string[]): string[] {
+  const stopwords = new Set([
+    '标题', '正文', '核心论点', '适用条件', '优势', '风险', '创建时间', '状态', '草稿', '新风格',
+    '的', '了', '和', '是', '在', '与', '并', '而', '也', '及', 'the', 'and', 'for'
+  ]);
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const word of words || []) {
+    const normalized = (word || '').trim();
+    if (!normalized) {
+      continue;
+    }
+    if (stopwords.has(normalized) || stopwords.has(normalized.toLowerCase())) {
+      continue;
+    }
+    if (/^\d+([.)、:：-]\d+)*$/.test(normalized)) {
+      continue;
+    }
+    if (/^[#*_`~\-+=|\\/]+$/.test(normalized)) {
+      continue;
+    }
+    const core = normalized.replace(/[^\p{L}\p{N}\u4E00-\u9FFF]/gu, '');
+    if (core.length < 2) {
+      continue;
+    }
+    const dedup = normalized.toLowerCase();
+    if (seen.has(dedup)) {
+      continue;
+    }
+    seen.add(dedup);
+    result.push(normalized);
+  }
+  return result.slice(0, 40);
+}
+
+function buildStyleFingerprints(style: WritingStyle): string[] {
+  const fingerprints: string[] = [];
+  const transitions = (style.contentStructure?.transitionWords || []).slice(0, 4);
+  const sentencePatterns = (style.sentenceStructure?.sentencePatterns || []).slice(0, 4);
+  const punctuation = (style.punctuation?.specialPunctuation || []).slice(0, 3);
+  const favoriteWords = filterMeaningfulAnalysisWords(style.vocabulary?.favoriteWords || []).slice(0, 6);
+
+  transitions.forEach(item => fingerprints.push(`标志性过渡词：${item}`));
+  sentencePatterns.forEach(item => fingerprints.push(`句式模板：${item}`));
+  punctuation.forEach(item => fingerprints.push(`个性化标点：${item}`));
+  for (let i = 0; i + 1 < favoriteWords.length && i < 3; i += 1) {
+    fingerprints.push(`固定搭配候选：${favoriteWords[i]} + ${favoriteWords[i + 1]}`);
+  }
+  return Array.from(new Set(fingerprints)).slice(0, 10);
+}
+
 function getStyleAnalysisWebview(style: WritingStyle): string {
+  const favoriteWords = filterMeaningfulAnalysisWords(style.vocabulary?.favoriteWords || []);
+  const terminology = filterMeaningfulAnalysisWords(style.vocabulary?.terminology || []);
+  const colloquialisms = filterMeaningfulAnalysisWords(style.vocabulary?.colloquialisms || []);
+  const transitionWords = filterMeaningfulAnalysisWords(style.contentStructure?.transitionWords || []);
+  const structurePatterns = filterMeaningfulAnalysisWords(style.contentStructure?.structurePatterns || []);
+  const sentencePatterns = filterMeaningfulAnalysisWords(style.sentenceStructure?.sentencePatterns || []);
+  const connectives = filterMeaningfulAnalysisWords(style.logicType?.connectives || []);
+  const toneMarkers = filterMeaningfulAnalysisWords(style.tone?.markers || []);
+  const temporalMarkers = filterMeaningfulAnalysisWords(style.timePerspective?.temporalMarkers || []);
+  const emotionalWords = filterMeaningfulAnalysisWords(style.emotionalArc?.emotionalWords || []);
+  const specialPunctuation = filterMeaningfulAnalysisWords(style.punctuation?.specialPunctuation || []);
+  const fingerprints = buildStyleFingerprints(style);
+
+  const sentenceLength = style.sentenceStructure?.avgLength || 0;
+  const uniqueWordRatio = style.vocabulary?.uniqueWordRatio || 0;
+  const complexRatio = style.sentenceStructure?.complexSentenceRatio || 0;
+  const interactionLevel = style.audienceAwareness?.engagementLevel || 0;
+  const certainty = 1 - Math.min(1, (style.tone?.type === 'neutral' ? 0.4 : 0.2) + (style.tone?.intensity || 0) * 0.3);
+
   return `
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <style>
-                body {
-                    padding: 20px;
-                    font-family: var(--vscode-font-family);
-                    line-height: 1.6;
-                }
-                h2 { color: var(--vscode-editor-foreground); }
-                .metric {
-                    background: var(--vscode-editor-background);
-                    padding: 15px;
-                    margin: 10px 0;
-                    border-radius: 5px;
-                }
-                .metric-bar {
-                    height: 8px;
-                    background: var(--vscode-progressBar-background);
-                    border-radius: 4px;
-                    margin-top: 5px;
-                }
-                .tag {
-                    display: inline-block;
-                    background: var(--vscode-button-background);
-                    color: var(--vscode-button-foreground);
-                    padding: 3px 8px;
-                    margin: 3px;
-                    border-radius: 3px;
-                    font-size: 12px;
-                }
-            </style>
-        </head>
-        <body>
-            <h2>写作风格分析</h2>
-            
-            <div class="metric">
-                <label>平均句长: ${style.sentenceStructure?.avgLength?.toFixed(1) || 0} 字</label>
-                <div class="metric-bar" style="width: ${Math.min((style.sentenceStructure?.avgLength || 0) / 2, 100)}%"></div>
-            </div>
-            
-            <div class="metric">
-                <label>词汇丰富度: ${((style.vocabulary?.uniqueWordRatio || 0) * 100).toFixed(1)}%</label>
-                <div class="metric-bar" style="width: ${(style.vocabulary?.uniqueWordRatio || 0) * 100}%"></div>
-            </div>
-            
-            <div class="metric">
-                <label>语气类型: ${style.tone?.type || 'neutral'}</label>
-            </div>
-            
-            <div class="metric">
-                <label>情感倾向: ${style.emotionalArc?.overallTrend || 'neutral'}</label>
-            </div>
-            
-            <h3>常用词汇</h3>
-            <div>
-                ${(style.vocabulary?.favoriteWords || []).map((w: string) =>
-    `<span class="tag">${w}</span>`
-  ).join('')}
-            </div>
-            
-            <h3>结构特征</h3>
-            <div>
-                ${(style.contentStructure?.structurePatterns || []).map((p: string) =>
-    `<span class="tag">${p}</span>`
-  ).join('')}
-            </div>
-            
-            <h3>过渡词</h3>
-            <div>
-                ${(style.contentStructure?.transitionWords || []).map((w: string) =>
-    `<span class="tag">${w}</span>`
-  ).join('')}
-            </div>
-        </body>
-        </html>
-    `;
+    <!DOCTYPE html>
+    <html lang="zh-CN">
+    <head>
+      <meta charset="UTF-8" />
+      <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+      <style>
+        body {
+          padding: 20px;
+          font-family: var(--vscode-font-family);
+          color: var(--vscode-editor-foreground);
+          line-height: 1.6;
+        }
+        h2, h3 { margin: 0 0 10px; }
+        .section {
+          margin: 18px 0;
+          padding: 14px;
+          border: 1px solid var(--vscode-panel-border);
+          border-radius: 8px;
+          background: var(--vscode-editor-background);
+        }
+        .grid {
+          display: grid;
+          grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+          gap: 10px 16px;
+        }
+        .metric {
+          margin: 6px 0;
+        }
+        .metric-name {
+          color: var(--vscode-descriptionForeground);
+          margin-right: 4px;
+        }
+        .metric-bar {
+          height: 8px;
+          background: var(--vscode-progressBar-background);
+          border-radius: 4px;
+          margin-top: 4px;
+        }
+        .tag {
+          display: inline-block;
+          background: var(--vscode-button-secondaryBackground);
+          color: var(--vscode-button-secondaryForeground);
+          padding: 2px 8px;
+          margin: 2px 4px 2px 0;
+          border-radius: 999px;
+          font-size: 12px;
+        }
+        .muted {
+          color: var(--vscode-descriptionForeground);
+        }
+        ul {
+          margin: 6px 0 0 18px;
+          padding: 0;
+        }
+      </style>
+    </head>
+    <body>
+      <h2>写作风格分析</h2>
+
+      <div class="section">
+        <h3>1. 词汇层面</h3>
+        <div class="grid">
+          <div class="metric">
+            <span class="metric-name">用词偏好：</span>
+            <span>平均词长 ${style.vocabulary?.avgWordLength?.toFixed(1) || '0.0'}，词汇丰富度 ${formatPercent(uniqueWordRatio)}</span>
+            <div class="metric-bar" style="width:${Math.min(100, uniqueWordRatio * 100)}%"></div>
+          </div>
+          <div class="metric">
+            <span class="metric-name">情感色彩：</span>
+            <span>${escapeHtml(style.emotionalArc?.overallTrend || 'neutral')}（情感词 ${emotionalWords.length}）</span>
+          </div>
+          <div class="metric">
+            <span class="metric-name">专业术语密度：</span>
+            <span>${terminology.length} 项</span>
+          </div>
+          <div class="metric">
+            <span class="metric-name">缩略与简称：</span>
+            <span>${terminology.filter(item => /[A-Z]{2,}|[0-9]/.test(item)).length} 项</span>
+          </div>
+        </div>
+        <div><strong>常用词汇（已过滤无意义词）</strong><br/>${renderTags(favoriteWords)}</div>
+        <div><strong>术语/黑话</strong><br/>${renderTags(terminology)}</div>
+        <div><strong>口语表达</strong><br/>${renderTags(colloquialisms)}</div>
+      </div>
+
+      <div class="section">
+        <h3>2. 句法层面</h3>
+        <div class="grid">
+          <div class="metric">
+            <span class="metric-name">句子长度分布：</span>
+            <span>平均 ${sentenceLength.toFixed(1)} 字</span>
+            <div class="metric-bar" style="width:${Math.min(sentenceLength * 2, 100)}%"></div>
+          </div>
+          <div class="metric">
+            <span class="metric-name">句式结构：</span>
+            <span>复杂句占比 ${formatPercent(complexRatio)}，疑问句 ${formatPercent(style.sentenceStructure?.questionRatio || 0)}，感叹句 ${formatPercent(style.sentenceStructure?.exclamationRatio || 0)}</span>
+          </div>
+          <div class="metric">
+            <span class="metric-name">修辞手法：</span>
+            <span>比喻 ${style.rhetoric?.metaphor?.length || 0}，排比 ${style.rhetoric?.parallelism?.length || 0}，引用 ${style.rhetoric?.quotes?.length || 0}</span>
+          </div>
+          <div class="metric">
+            <span class="metric-name">标点运用：</span>
+            <span>逗号频率 ${(style.punctuation?.commaFrequency || 0).toFixed(3)}，句号频率 ${(style.punctuation?.periodFrequency || 0).toFixed(3)}</span>
+          </div>
+        </div>
+        <div><strong>常见句式</strong><br/>${renderTags(sentencePatterns)}</div>
+        <div><strong>特殊标点</strong><br/>${renderTags(specialPunctuation)}</div>
+      </div>
+
+      <div class="section">
+        <h3>3. 语篇层面</h3>
+        <div class="grid">
+          <div class="metric"><span class="metric-name">论证结构：</span><span>${escapeHtml(style.logicType?.type || 'narrative')}（论据风格：${escapeHtml(style.logicType?.evidenceStyle || 'general')}）</span></div>
+          <div class="metric"><span class="metric-name">段落组织：</span><span>段落均长 ${(style.contentStructure?.paragraphLength || 0).toFixed(1)}，开头 ${escapeHtml(style.contentStructure?.openingStyle || '标准开头')}，结尾 ${escapeHtml(style.contentStructure?.endingStyle || '标准结尾')}</span></div>
+          <div class="metric"><span class="metric-name">信息密度：</span><span>密度 ${formatPercent(style.informationDensity?.density || 0)}，复杂度 ${formatPercent(style.informationDensity?.complexity || 0)}</span></div>
+          <div class="metric"><span class="metric-name">叙事视角：</span><span>${escapeHtml(style.spacePerspective?.viewpoint || 'third-person')}（时间主导：${escapeHtml(style.timePerspective?.dominant || 'present')}）</span></div>
+        </div>
+        <div><strong>结构模式</strong><br/>${renderTags(structurePatterns)}</div>
+        <div><strong>逻辑连接词</strong><br/>${renderTags(connectives)}</div>
+      </div>
+
+      <div class="section">
+        <h3>4. 语气与视角</h3>
+        <div class="grid">
+          <div class="metric"><span class="metric-name">人称与视角：</span><span>${escapeHtml(style.spacePerspective?.viewpoint || 'third-person')}，叙事声音 ${escapeHtml(style.narrativeVoice?.voice || 'neutral')}</span></div>
+          <div class="metric"><span class="metric-name">确定性程度：</span><span>${formatPercent(Math.max(0, Math.min(1, certainty)))}（估计）</span></div>
+          <div class="metric">
+            <span class="metric-name">互动性：</span><span>${formatPercent(interactionLevel)}（受众意识）</span>
+            <div class="metric-bar" style="width:${Math.min(100, interactionLevel * 100)}%"></div>
+          </div>
+          <div class="metric"><span class="metric-name">权力距离：</span><span>${escapeHtml(style.culturalContext?.register || 'informal')} / ${escapeHtml(style.narrativeVoice?.stance || '平等探讨')}</span></div>
+        </div>
+        <div><strong>语气标记词</strong><br/>${renderTags(toneMarkers)}</div>
+        <div><strong>时间标记词</strong><br/>${renderTags(temporalMarkers)}</div>
+      </div>
+
+      <div class="section">
+        <h3>5. 独特标识（指纹特征）</h3>
+        ${fingerprints.length > 0
+    ? `<ul>${fingerprints.map(item => `<li>${escapeHtml(item)}</li>`).join('')}</ul>`
+    : '<span class="muted">暂无稳定指纹，可在更多样本后重试分析。</span>'}
+        <div style="margin-top:8px;"><strong>标志性过渡词</strong><br/>${renderTags(transitionWords)}</div>
+      </div>
+    </body>
+    </html>
+  `;
 }
 
 export function deactivate(): void {

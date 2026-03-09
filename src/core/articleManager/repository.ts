@@ -1,5 +1,7 @@
 import * as vscode from 'vscode';
+import * as path from 'path';
 import { v4 as uuidv4 } from 'uuid';
+import { fileExists, readJsonFile, writeJsonFile } from '../storage/jsonFileStore';
 
 export interface ArticleRecord {
   id: string;
@@ -20,10 +22,17 @@ type SerializedArticleRecord = Omit<ArticleRecord, 'createdAt' | 'updatedAt'> & 
 
 export class ArticleRepository {
   private static readonly STORAGE_KEY = 'writingAgent.articleCollection.v1';
+  private readonly storageFilePath?: string;
   private records: ArticleRecord[];
 
-  constructor(private readonly context: vscode.ExtensionContext) {
+  constructor(private readonly context: vscode.ExtensionContext, storageRootPath?: string) {
+    if (storageRootPath) {
+      this.storageFilePath = path.join(storageRootPath, 'data', 'articles.index.json');
+    }
     this.records = this.load();
+    if (this.storageFilePath && !fileExists(this.storageFilePath) && this.records.length > 0) {
+      void this.persist();
+    }
   }
 
   listAll(): ArticleRecord[] {
@@ -115,16 +124,30 @@ export class ArticleRepository {
     return changed;
   }
 
-  async pruneMissingFiles(workspaceRoot: vscode.Uri): Promise<{ removed: number; checked: number }> {
+  async pruneMissingFiles(roots: vscode.Uri[]): Promise<{ removed: number; checked: number }> {
+    const availableRoots = roots.filter(root => root && root.path);
+    if (availableRoots.length === 0) {
+      return { removed: 0, checked: this.records.length };
+    }
+
     const kept: ArticleRecord[] = [];
     let removed = 0;
 
     for (const record of this.records) {
-      const targetUri = vscode.Uri.joinPath(workspaceRoot, ...record.relativePath.split('/'));
-      try {
-        await vscode.workspace.fs.stat(targetUri);
+      let exists = false;
+      for (const root of availableRoots) {
+        const targetUri = vscode.Uri.joinPath(root, ...record.relativePath.split('/'));
+        try {
+          await vscode.workspace.fs.stat(targetUri);
+          exists = true;
+          break;
+        } catch {
+          // 尝试下一个根目录。
+        }
+      }
+      if (exists) {
         kept.push(record);
-      } catch {
+      } else {
         removed += 1;
       }
     }
@@ -138,7 +161,12 @@ export class ArticleRepository {
   }
 
   private load(): ArticleRecord[] {
-    const raw = this.context.workspaceState.get<SerializedArticleRecord[]>(ArticleRepository.STORAGE_KEY, []);
+    const raw = this.storageFilePath
+      ? readJsonFile<SerializedArticleRecord[]>(
+        this.storageFilePath,
+        this.context.workspaceState.get<SerializedArticleRecord[]>(ArticleRepository.STORAGE_KEY, [])
+      )
+      : this.context.workspaceState.get<SerializedArticleRecord[]>(ArticleRepository.STORAGE_KEY, []);
     return raw.map(item => ({
       ...item,
       createdAt: new Date(item.createdAt),
@@ -152,6 +180,10 @@ export class ArticleRepository {
       createdAt: record.createdAt.toISOString(),
       updatedAt: record.updatedAt.toISOString()
     }));
+    if (this.storageFilePath) {
+      writeJsonFile(this.storageFilePath, payload);
+      return;
+    }
     await this.context.workspaceState.update(ArticleRepository.STORAGE_KEY, payload);
   }
 }

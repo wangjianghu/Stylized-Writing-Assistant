@@ -1,7 +1,9 @@
 import * as vscode from 'vscode';
+import * as path from 'path';
 import { v4 as uuidv4 } from 'uuid';
 import { MaterialType, SearchQuery, WritingMaterial } from '../types';
 import { TextPreprocessor } from '../../utils/textPreprocessor';
+import { fileExists, readJsonFile, writeJsonFile } from '../storage/jsonFileStore';
 
 type SerializedWritingMaterial = Omit<WritingMaterial, 'metadata'> & {
   metadata: Omit<WritingMaterial['metadata'], 'createdAt' | 'updatedAt' | 'lastUsedAt'> & {
@@ -22,11 +24,18 @@ export class MaterialRepository {
   private static readonly LEGACY_BUCKET_ID = '__legacy__';
 
   private readonly preprocessor: TextPreprocessor;
+  private readonly storageFilePath?: string;
   private materialsByStyle: Map<string, WritingMaterial[]>;
 
-  constructor(private readonly context: vscode.ExtensionContext) {
+  constructor(private readonly context: vscode.ExtensionContext, storageRootPath?: string) {
+    if (storageRootPath) {
+      this.storageFilePath = path.join(storageRootPath, 'data', 'materials.by-style.json');
+    }
     this.preprocessor = new TextPreprocessor();
     this.materialsByStyle = this.loadMaterialsByStyle();
+    if (this.storageFilePath && !fileExists(this.storageFilePath) && this.materialsByStyle.size > 0) {
+      void this.persist();
+    }
   }
 
   getAll(styleId: string): WritingMaterial[] {
@@ -399,10 +408,18 @@ export class MaterialRepository {
   }
 
   private loadMaterialsByStyle(): Map<string, WritingMaterial[]> {
-    const fromBuckets = this.context.workspaceState.get<SerializedMaterialBuckets>(
-      MaterialRepository.STORAGE_KEY,
-      {}
-    );
+    const fromBuckets = this.storageFilePath
+      ? readJsonFile<SerializedMaterialBuckets>(
+        this.storageFilePath,
+        this.context.workspaceState.get<SerializedMaterialBuckets>(
+          MaterialRepository.STORAGE_KEY,
+          {}
+        )
+      )
+      : this.context.workspaceState.get<SerializedMaterialBuckets>(
+        MaterialRepository.STORAGE_KEY,
+        {}
+      );
 
     const hasBuckets = Object.keys(fromBuckets).length > 0;
     if (hasBuckets) {
@@ -436,6 +453,10 @@ export class MaterialRepository {
     this.materialsByStyle.forEach((materials, styleId) => {
       payload[styleId] = materials.map(material => this.serialize(material));
     });
+    if (this.storageFilePath) {
+      writeJsonFile(this.storageFilePath, payload);
+      return;
+    }
     await this.context.workspaceState.update(MaterialRepository.STORAGE_KEY, payload);
   }
 

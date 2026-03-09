@@ -6,6 +6,15 @@ import { TextPreprocessor } from '../../utils/textPreprocessor';
  */
 export class StyleAnalyzer {
   private preprocessor: TextPreprocessor;
+  private static readonly COMMON_STOPWORDS = new Set([
+    '的', '了', '和', '是', '在', '与', '及', '并', '且', '而', '或', '但', '把', '被', '对', '将', '向',
+    '这', '那', '这些', '那些', '一个', '一种', '一些', '这个', '那个', '可以', '以及', '需要', '进行', '通过',
+    '我们', '你们', '他们', '她们', '它们', '自己', '已经', '如果', '因为', '所以', '由于', '因此', '然后', '同时',
+    'the', 'a', 'an', 'and', 'or', 'but', 'is', 'are', 'was', 'were', 'to', 'of', 'in', 'on', 'for', 'with'
+  ]);
+  private static readonly PROMPT_ARTIFACT_WORDS = new Set([
+    '标题', '正文', '核心论点', '适用条件', '优势', '风险', '创建时间', '状态', '草稿', '新风格', '输出要求'
+  ]);
 
   constructor() {
     this.preprocessor = new TextPreprocessor();
@@ -53,38 +62,49 @@ export class StyleAnalyzer {
    * 1. 分析词汇特征
    */
   private analyzeVocabulary(tokens: string[]): WritingStyle['vocabulary'] {
-    const uniqueTokens = new Set(tokens);
-    const wordLengths = tokens.map(t => t.length);
+    const normalizedTokens = tokens
+      .map(token => this.normalizeLexicalToken(token))
+      .filter(Boolean);
+    const meaningfulTokens = normalizedTokens.filter(token => this.isMeaningfulLexicalToken(token));
+    const baseTokens = meaningfulTokens.length > 0 ? meaningfulTokens : normalizedTokens;
+    const uniqueTokens = new Set(baseTokens);
+    const wordLengths = baseTokens.map(t => t.length);
 
     // 计算词频
     const wordFreq = new Map<string, number>();
-    tokens.forEach(t => {
+    baseTokens.forEach(t => {
       wordFreq.set(t, (wordFreq.get(t) || 0) + 1);
     });
 
-    // 高频词（排除停用词）
-    const stopwords = new Set(['的', '是', '在', '了', '和', '等', 'the', 'a', 'an', 'is', 'are']);
+    const sortedByFreq = Array.from(wordFreq.entries()).sort((a, b) => b[1] - a[1]);
+
+    // 高频词（过滤停用词、模板词、编号等无意义词）
     const topWords = Array.from(wordFreq.entries())
-      .filter(([word]) => !stopwords.has(word.toLowerCase()) && word.length > 1)
+      .filter(([word]) => this.isMeaningfulLexicalToken(word))
       .sort((a, b) => b[1] - a[1])
       .slice(0, 50)
       .map(([word]) => word);
 
-    // 识别专业术语（简单规则：包含大写字母、数字或特殊字符）
-    const terminology = tokens.filter(t => 
-      /[A-Z]{2,}/.test(t) || /\d/.test(t) || /[\-_]/.test(t)
+    const rareWords = sortedByFreq
+      .filter(([word, count]) => count <= 2 && this.isMeaningfulLexicalToken(word))
+      .slice(0, 12)
+      .map(([word]) => word);
+
+    // 识别专业术语（大写缩写、行业复合词、含技术符号）
+    const terminology = baseTokens.filter(t =>
+      this.isLikelyTerminologyToken(t)
     );
 
     // 识别口语化表达
-    const colloquialisms = tokens.filter(t => 
+    const colloquialisms = baseTokens.filter(t =>
       ['嗯', '啊', '吧', '呢', '嘛', '哦'].includes(t)
     );
 
     return {
       avgWordLength: this.average(wordLengths),
-      uniqueWordRatio: uniqueTokens.size / Math.max(tokens.length, 1),
+      uniqueWordRatio: uniqueTokens.size / Math.max(baseTokens.length, 1),
       favoriteWords: topWords.slice(0, 20),
-      rareWords: topWords.slice(-10),
+      rareWords,
       terminology: [...new Set(terminology)].slice(0, 20),
       colloquialisms: [...new Set(colloquialisms)]
     };
@@ -572,5 +592,59 @@ export class StyleAnalyzer {
       quotes.push(...quoteMatches.map(q => q.replace(/[""「」『』]/g, '')));
     }
     return quotes.slice(0, 10);
+  }
+
+  private normalizeLexicalToken(token: string): string {
+    return (token || '')
+      .trim()
+      .replace(/[“”"‘’'`]/g, '')
+      .replace(/^[,，。！？!?;；:：、\-_=+*#~`<>()[\]{}\\/|]+/g, '')
+      .replace(/[,，。！？!?;；:：、\-_=+*#~`<>()[\]{}\\/|]+$/g, '')
+      .trim();
+  }
+
+  private isMeaningfulLexicalToken(token: string): boolean {
+    if (!token) {
+      return false;
+    }
+    const lower = token.toLowerCase();
+    if (StyleAnalyzer.COMMON_STOPWORDS.has(lower) || StyleAnalyzer.COMMON_STOPWORDS.has(token)) {
+      return false;
+    }
+    if (StyleAnalyzer.PROMPT_ARTIFACT_WORDS.has(token)) {
+      return false;
+    }
+    if (/^\d+([.)、:：-]\d+)*$/.test(token)) {
+      return false;
+    }
+    if (/^[#*_`~\-+=|\\/]+$/.test(token)) {
+      return false;
+    }
+    if (/^[0-9]{4}([./-][0-9]{1,2}){1,2}$/.test(token)) {
+      return false;
+    }
+    if (/^[0-9]{1,2}:[0-9]{2}(:[0-9]{2})?$/.test(token)) {
+      return false;
+    }
+    const compact = token.replace(/\s+/g, '');
+    if (compact.length < 2 || compact.length > 24) {
+      return false;
+    }
+    const core = compact.replace(/[^\p{L}\p{N}\u4E00-\u9FFF]/gu, '');
+    if (core.length < 2) {
+      return false;
+    }
+    return true;
+  }
+
+  private isLikelyTerminologyToken(token: string): boolean {
+    if (!token || !this.isMeaningfulLexicalToken(token)) {
+      return false;
+    }
+    return /[A-Z]{2,}/.test(token)
+      || /[A-Za-z]+[0-9]+/.test(token)
+      || /[0-9]+[A-Za-z]+/.test(token)
+      || /[\-_]/.test(token)
+      || token.length >= 6;
   }
 }

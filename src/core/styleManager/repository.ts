@@ -1,6 +1,8 @@
 import * as vscode from 'vscode';
+import * as path from 'path';
 import { v4 as uuidv4 } from 'uuid';
 import { StyleProfile, WritingStyle } from '../types';
+import { fileExists, readJsonFile, writeJsonFile } from '../storage/jsonFileStore';
 
 type SerializedStyleProfile = Omit<StyleProfile, 'createdAt' | 'updatedAt' | 'style'> & {
   createdAt: string;
@@ -22,16 +24,26 @@ type SerializedWritingStyle = Omit<WritingStyle, 'createdAt' | 'updatedAt' | 'se
 export class StyleRepository {
   private static readonly STYLES_KEY = 'writingAgent.styles.v1';
   private static readonly ACTIVE_STYLE_ID_KEY = 'writingAgent.styles.activeId';
+  private readonly stylesFilePath?: string;
+  private readonly stateFilePath?: string;
   private profiles: StyleProfile[];
   private activeProfileId: string | null;
 
-  constructor(private readonly context: vscode.ExtensionContext) {
+  constructor(private readonly context: vscode.ExtensionContext, storageRootPath?: string) {
+    if (storageRootPath) {
+      const dataDir = path.join(storageRootPath, 'data');
+      this.stylesFilePath = path.join(dataDir, 'styles.json');
+      this.stateFilePath = path.join(dataDir, 'styles.state.json');
+    }
     this.profiles = this.loadProfiles();
-    this.activeProfileId = this.context.workspaceState.get<string | null>(
-      StyleRepository.ACTIVE_STYLE_ID_KEY,
-      null
-    );
+    this.activeProfileId = this.loadActiveProfileId();
     this.ensureValidActiveProfile();
+    if (this.stylesFilePath && !fileExists(this.stylesFilePath) && this.profiles.length > 0) {
+      void this.persistProfiles();
+    }
+    if (this.stateFilePath && !fileExists(this.stateFilePath) && this.activeProfileId) {
+      void this.persistActiveProfileState();
+    }
   }
 
   listProfiles(): StyleProfile[] {
@@ -59,7 +71,7 @@ export class StyleRepository {
       throw new Error('目标风格不存在');
     }
     this.activeProfileId = id;
-    await this.context.workspaceState.update(StyleRepository.ACTIVE_STYLE_ID_KEY, this.activeProfileId);
+    await this.persistActiveProfileState();
   }
 
   async createProfile(name: string, style?: WritingStyle): Promise<StyleProfile> {
@@ -92,6 +104,19 @@ export class StyleRepository {
     return profile;
   }
 
+  async refreshProfileStyle(id: string, style: WritingStyle, source?: string): Promise<StyleProfile> {
+    const profile = this.getProfile(id);
+    if (!profile) {
+      throw new Error('目标风格不存在');
+    }
+
+    profile.style = this.normalizeStyle(style);
+    profile.updatedAt = new Date();
+    profile.lastSource = source || profile.lastSource;
+    await this.persistProfiles();
+    return profile;
+  }
+
   async renameProfile(id: string, name: string): Promise<void> {
     const profile = this.getProfile(id);
     if (!profile) {
@@ -118,7 +143,7 @@ export class StyleRepository {
     if (this.activeProfileId === id) {
       const fallback = this.listProfiles()[0];
       this.activeProfileId = fallback?.id || null;
-      await this.context.workspaceState.update(StyleRepository.ACTIVE_STYLE_ID_KEY, this.activeProfileId);
+      await this.persistActiveProfileState();
     }
 
     await this.persistProfiles();
@@ -131,7 +156,7 @@ export class StyleRepository {
     const exists = this.profiles.some(profile => profile.id === this.activeProfileId);
     if (!exists) {
       this.activeProfileId = null;
-      void this.context.workspaceState.update(StyleRepository.ACTIVE_STYLE_ID_KEY, null);
+      void this.persistActiveProfileState();
     }
   }
 
@@ -157,16 +182,46 @@ export class StyleRepository {
   }
 
   private loadProfiles(): StyleProfile[] {
-    const rawProfiles = this.context.workspaceState.get<SerializedStyleProfile[]>(
-      StyleRepository.STYLES_KEY,
-      []
-    );
+    const rawProfiles = this.stylesFilePath
+      ? readJsonFile<SerializedStyleProfile[]>(
+        this.stylesFilePath,
+        this.context.workspaceState.get<SerializedStyleProfile[]>(StyleRepository.STYLES_KEY, [])
+      )
+      : this.context.workspaceState.get<SerializedStyleProfile[]>(StyleRepository.STYLES_KEY, []);
     return rawProfiles.map(raw => this.deserializeProfile(raw));
   }
 
   private async persistProfiles(): Promise<void> {
     const rawProfiles = this.profiles.map(profile => this.serializeProfile(profile));
+    if (this.stylesFilePath) {
+      writeJsonFile(this.stylesFilePath, rawProfiles);
+      return;
+    }
     await this.context.workspaceState.update(StyleRepository.STYLES_KEY, rawProfiles);
+  }
+
+  private loadActiveProfileId(): string | null {
+    if (this.stateFilePath) {
+      const state = readJsonFile<{ activeProfileId?: string | null }>(
+        this.stateFilePath,
+        {
+          activeProfileId: this.context.workspaceState.get<string | null>(
+            StyleRepository.ACTIVE_STYLE_ID_KEY,
+            null
+          )
+        }
+      );
+      return state.activeProfileId || null;
+    }
+    return this.context.workspaceState.get<string | null>(StyleRepository.ACTIVE_STYLE_ID_KEY, null);
+  }
+
+  private async persistActiveProfileState(): Promise<void> {
+    if (this.stateFilePath) {
+      writeJsonFile(this.stateFilePath, { activeProfileId: this.activeProfileId });
+      return;
+    }
+    await this.context.workspaceState.update(StyleRepository.ACTIVE_STYLE_ID_KEY, this.activeProfileId);
   }
 
   private serializeProfile(profile: StyleProfile): SerializedStyleProfile {

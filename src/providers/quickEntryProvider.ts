@@ -84,6 +84,16 @@ export class QuickEntryProvider implements vscode.TreeDataProvider<QuickEntryIte
         }
       },
       {
+        id: 'suggestion-min-chars',
+        label: '补全触发字数',
+        description: '设置自动补全最小触发字符数',
+        iconId: 'symbol-number',
+        command: {
+          command: 'writingAgent.configureSuggestionMinChars',
+          title: '设置自动补全最小触发字符数'
+        }
+      },
+      {
         id: 'apply-ai-result',
         label: '写入 AI 结果',
         description: '把聊天复制内容落盘到当前文稿',
