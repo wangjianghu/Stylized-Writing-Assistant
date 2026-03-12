@@ -26,6 +26,7 @@ export class StyleRepository {
   private static readonly ACTIVE_STYLE_ID_KEY = 'writingAgent.styles.activeId';
   private readonly stylesFilePath?: string;
   private readonly stateFilePath?: string;
+  private loaded = false;
   private profiles: StyleProfile[];
   private activeProfileId: string | null;
 
@@ -35,30 +36,27 @@ export class StyleRepository {
       this.stylesFilePath = path.join(dataDir, 'styles.json');
       this.stateFilePath = path.join(dataDir, 'styles.state.json');
     }
-    this.profiles = this.loadProfiles();
-    this.activeProfileId = this.loadActiveProfileId();
-    this.ensureValidActiveProfile();
-    if (this.stylesFilePath && !fileExists(this.stylesFilePath) && this.profiles.length > 0) {
-      void this.persistProfiles();
-    }
-    if (this.stateFilePath && !fileExists(this.stateFilePath) && this.activeProfileId) {
-      void this.persistActiveProfileState();
-    }
+    this.profiles = [];
+    this.activeProfileId = null;
   }
 
   listProfiles(): StyleProfile[] {
+    this.ensureLoaded();
     return [...this.profiles].sort((a, b) => b.updatedAt.getTime() - a.updatedAt.getTime());
   }
 
   getProfile(id: string): StyleProfile | undefined {
+    this.ensureLoaded();
     return this.profiles.find(profile => profile.id === id);
   }
 
   getActiveProfileId(): string | null {
+    this.ensureLoaded();
     return this.activeProfileId;
   }
 
   getActiveProfile(): StyleProfile | null {
+    this.ensureLoaded();
     if (!this.activeProfileId) {
       return null;
     }
@@ -66,6 +64,7 @@ export class StyleRepository {
   }
 
   async setActiveProfile(id: string): Promise<void> {
+    this.ensureLoaded();
     const profile = this.getProfile(id);
     if (!profile) {
       throw new Error('目标风格不存在');
@@ -75,6 +74,7 @@ export class StyleRepository {
   }
 
   async createProfile(name: string, style?: WritingStyle): Promise<StyleProfile> {
+    this.ensureLoaded();
     const now = new Date();
     const uniqueName = this.toUniqueName(name || '新风格');
     const profile: StyleProfile = {
@@ -91,6 +91,7 @@ export class StyleRepository {
   }
 
   async updateProfile(id: string, style: WritingStyle, source?: string): Promise<StyleProfile> {
+    this.ensureLoaded();
     const profile = this.getProfile(id);
     if (!profile) {
       throw new Error('目标风格不存在');
@@ -105,6 +106,7 @@ export class StyleRepository {
   }
 
   async refreshProfileStyle(id: string, style: WritingStyle, source?: string): Promise<StyleProfile> {
+    this.ensureLoaded();
     const profile = this.getProfile(id);
     if (!profile) {
       throw new Error('目标风格不存在');
@@ -118,6 +120,7 @@ export class StyleRepository {
   }
 
   async renameProfile(id: string, name: string): Promise<void> {
+    this.ensureLoaded();
     const profile = this.getProfile(id);
     if (!profile) {
       throw new Error('目标风格不存在');
@@ -133,6 +136,7 @@ export class StyleRepository {
   }
 
   async deleteProfile(id: string): Promise<void> {
+    this.ensureLoaded();
     const existingIndex = this.profiles.findIndex(profile => profile.id === id);
     if (existingIndex < 0) {
       throw new Error('目标风格不存在');
@@ -147,6 +151,22 @@ export class StyleRepository {
     }
 
     await this.persistProfiles();
+  }
+
+  private ensureLoaded(): void {
+    if (this.loaded) {
+      return;
+    }
+    this.loaded = true;
+    this.profiles = this.loadProfiles();
+    this.activeProfileId = this.loadActiveProfileId();
+    this.ensureValidActiveProfile();
+    if (this.stylesFilePath && !fileExists(this.stylesFilePath) && this.profiles.length > 0) {
+      void this.persistProfiles();
+    }
+    if (this.stateFilePath && !fileExists(this.stateFilePath) && this.activeProfileId) {
+      void this.persistActiveProfileState();
+    }
   }
 
   private ensureValidActiveProfile(): void {

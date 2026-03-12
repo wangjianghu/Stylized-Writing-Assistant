@@ -23,27 +23,28 @@ type SerializedArticleRecord = Omit<ArticleRecord, 'createdAt' | 'updatedAt'> & 
 export class ArticleRepository {
   private static readonly STORAGE_KEY = 'writingAgent.articleCollection.v1';
   private readonly storageFilePath?: string;
+  private loaded = false;
   private records: ArticleRecord[];
 
   constructor(private readonly context: vscode.ExtensionContext, storageRootPath?: string) {
     if (storageRootPath) {
       this.storageFilePath = path.join(storageRootPath, 'data', 'articles.index.json');
     }
-    this.records = this.load();
-    if (this.storageFilePath && !fileExists(this.storageFilePath) && this.records.length > 0) {
-      void this.persist();
-    }
+    this.records = [];
   }
 
   listAll(): ArticleRecord[] {
+    this.ensureLoaded();
     return [...this.records].sort((a, b) => b.updatedAt.getTime() - a.updatedAt.getTime());
   }
 
   listByStyle(styleId: string): ArticleRecord[] {
+    this.ensureLoaded();
     return this.listAll().filter(record => record.styleId === styleId);
   }
 
   getById(id: string): ArticleRecord | undefined {
+    this.ensureLoaded();
     return this.records.find(record => record.id === id);
   }
 
@@ -54,6 +55,7 @@ export class ArticleRepository {
       updatedAt?: Date;
     }
   ): Promise<ArticleRecord> {
+    this.ensureLoaded();
     const now = new Date();
     const existing = this.records.find(record => record.relativePath === input.relativePath || record.id === input.id);
 
@@ -87,6 +89,7 @@ export class ArticleRepository {
   }
 
   async touch(id: string): Promise<void> {
+    this.ensureLoaded();
     const target = this.getById(id);
     if (!target) {
       return;
@@ -96,6 +99,7 @@ export class ArticleRepository {
   }
 
   async deleteById(id: string): Promise<ArticleRecord | undefined> {
+    this.ensureLoaded();
     const index = this.records.findIndex(record => record.id === id);
     if (index < 0) {
       return undefined;
@@ -106,6 +110,7 @@ export class ArticleRepository {
   }
 
   async replacePathPrefix(fromPrefix: string, toPrefix: string): Promise<number> {
+    this.ensureLoaded();
     const normalizedFrom = fromPrefix.replace(/^\/+/, '').replace(/\/+$/, '');
     const normalizedTo = toPrefix.replace(/^\/+/, '').replace(/\/+$/, '');
     let changed = 0;
@@ -125,6 +130,7 @@ export class ArticleRepository {
   }
 
   async pruneMissingFiles(roots: vscode.Uri[]): Promise<{ removed: number; checked: number }> {
+    this.ensureLoaded();
     const availableRoots = roots.filter(root => root && root.path);
     if (availableRoots.length === 0) {
       return { removed: 0, checked: this.records.length };
@@ -158,6 +164,17 @@ export class ArticleRepository {
     }
 
     return { removed, checked: this.records.length + removed };
+  }
+
+  private ensureLoaded(): void {
+    if (this.loaded) {
+      return;
+    }
+    this.loaded = true;
+    this.records = this.load();
+    if (this.storageFilePath && !fileExists(this.storageFilePath) && this.records.length > 0) {
+      void this.persist();
+    }
   }
 
   private load(): ArticleRecord[] {

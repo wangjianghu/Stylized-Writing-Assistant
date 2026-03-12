@@ -2,7 +2,7 @@
   "name": "writing-agent",
   "displayName": "风格化写作助手",
   "description": "智能写作助手，自动学习风格，生成风格一致的文章",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "publisher": "daydayup2026",
   "icon": "resources/icon.png",
   "engines": {
@@ -207,17 +207,17 @@
         {
           "id": "articleCollection",
           "name": "文集",
-          "visibility": "visible"
+          "visibility": "collapsed"
         },
         {
           "id": "materialLibrary",
           "name": "素材库",
-          "visibility": "visible"
+          "visibility": "collapsed"
         },
         {
           "id": "styleProfile",
           "name": "风格配置",
-          "visibility": "visible"
+          "visibility": "collapsed"
         }
       ],
       "explorer": [
@@ -229,17 +229,17 @@
         {
           "id": "articleCollectionExplorer",
           "name": "文集",
-          "visibility": "visible"
+          "visibility": "collapsed"
         },
         {
           "id": "materialLibraryExplorer",
           "name": "素材库",
-          "visibility": "visible"
+          "visibility": "collapsed"
         },
         {
           "id": "styleProfileExplorer",
           "name": "风格配置",
-          "visibility": "visible"
+          "visibility": "collapsed"
         }
       ]
     },

@@ -88,6 +88,15 @@ interface StorageRootResolutionCache {
   resolvedPath: string;
 }
 
+type RewriteApplyMode = 'replace' | 'insertAfter';
+
+interface PendingRewriteApplyDecision {
+  editorUri: string;
+  selectionRange: vscode.Range;
+  resolve: (mode: RewriteApplyMode | undefined) => void;
+  timeoutHandle: NodeJS.Timeout;
+}
+
 interface DeleteStyleArticlesResult {
   removedRecords: number;
   deletedFiles: number;
@@ -139,12 +148,12 @@ const LEGACY_COLLECTION_RELATIVE_PREFIX = '.writing-agent/文集';
 const STORAGE_DATA_RELATIVE_PREFIX = 'data';
 const STORAGE_DEFAULT_DIR_NAME = 'writing-angent';
 const STATUS_MESSAGE_TIMEOUT_MS = 5000;
-const SHOW_ASSISTANT_DEBOUNCE_MS = 250;
 const SUGGESTION_CACHE_TTL_MS = 20_000;
 const COMPLETION_MAX_ITEMS = 6;
 const API_VALIDATION_TIMEOUT_MIN_MS = 8000;
 const API_VALIDATION_TIMEOUT_MAX_MS = 30000;
 const DEFERRED_BOOTSTRAP_DELAY_MS = 1200;
+const REWRITE_APPLY_OVERLAY_TIMEOUT_MS = 45_000;
 const COMPLETION_DOCUMENT_SELECTOR: vscode.DocumentSelector = [
   { scheme: 'file', language: 'markdown' },
   { scheme: 'untitled', language: 'markdown' },
@@ -152,11 +161,12 @@ const COMPLETION_DOCUMENT_SELECTOR: vscode.DocumentSelector = [
   { scheme: 'untitled', language: 'plaintext' }
 ];
 const COMPLETION_TRIGGER_CHARACTERS = [' ', '，', '。', '；', '：', ',', '.', ';', ':', '、', '！', '？'];
-let showAssistantViewLockUntil = 0;
 let showAssistantViewsInFlight: Promise<void> | null = null;
 let cachedMammothModule: MammothModule | null | undefined;
 let activeExtensionContext: vscode.ExtensionContext | null = null;
 let storageRootPathCache: string | null = null;
+let rewriteApplyDecorationType: vscode.TextEditorDecorationType | null = null;
+let pendingRewriteApplyDecision: PendingRewriteApplyDecision | null = null;
 const PROVIDER_PRESETS: Record<ApiProvider, ProviderPreset> = {
   iflow: {
     provider: 'iflow',
@@ -288,6 +298,21 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.window.registerTreeDataProvider('materialLibraryExplorer', materialLibraryProvider),
     vscode.window.registerTreeDataProvider('styleProfileExplorer', styleProfileProvider)
   );
+  rewriteApplyDecorationType = vscode.window.createTextEditorDecorationType({
+    borderWidth: '1px',
+    borderStyle: 'solid',
+    borderColor: 'var(--vscode-focusBorder)',
+    backgroundColor: 'var(--vscode-editor-selectionBackground)',
+    rangeBehavior: vscode.DecorationRangeBehavior.ClosedClosed
+  });
+  context.subscriptions.push({
+    dispose: () => {
+      clearRewriteApplyDecorations();
+      rewriteApplyDecorationType?.dispose();
+      rewriteApplyDecorationType = null;
+      resolvePendingRewriteApplyDecision(undefined);
+    }
+  });
   const deferredLanguageFeaturesTimer = setTimeout(() => {
     context.subscriptions.push(
       vscode.languages.registerCompletionItemProvider(
@@ -546,24 +571,13 @@ export function activate(context: vscode.ExtensionContext): void {
         clearSuggestionCache(styleId);
 
         progress.report({ increment: 100, message: '完成' });
-        const message = outputMode === 'outline'
-          ? `已在文集创建《${articleFile.title}》，并在文件末尾写入写作提纲。`
-          : `已在文集创建《${articleFile.title}》，并在文件末尾写入正文。`;
-        const actions = ['打开文集'];
         if (shouldPromptApiConfig) {
-          actions.push('配置 API');
+          notifyWarn('API Key 未配置，本次使用本地草稿；可在“写作助手: 配置 API”完成后再试。');
         }
         if (routedToIdeChat) {
-          actions.push('写入 AI 结果');
+          notifyInfo('已填充 IDE AI 提示词，可执行“写作助手: 写入 AI 结果”落盘。');
         }
-        const action = await vscode.window.showInformationMessage(message, ...actions);
-        if (action === '打开文集') {
-          await vscode.commands.executeCommand('writingAgent.showArticleCollection');
-        } else if (action === '配置 API') {
-          await vscode.commands.executeCommand('writingAgent.configureApi');
-        } else if (action === '写入 AI 结果') {
-          await vscode.commands.executeCommand('writingAgent.applyClipboardToDraft');
-        }
+        await vscode.commands.executeCommand('writingAgent.showArticleCollection');
       }
     );
   });
@@ -1279,7 +1293,7 @@ export function activate(context: vscode.ExtensionContext): void {
         }
       );
 
-      const outputMode = await pickRewriteApplyModeWithPreview(rewritten);
+      const outputMode = await pickRewriteApplyModeWithPreview(editor, selectionRange, rewritten);
       if (!outputMode) {
         return;
       }
@@ -1608,34 +1622,51 @@ export function activate(context: vscode.ExtensionContext): void {
   });
 
   registerSafeCommand(context, 'writingAgent.showAssistantViews', async () => {
-    const now = Date.now();
-    if (now < showAssistantViewLockUntil) {
-      return;
-    }
     if (showAssistantViewsInFlight) {
       await showAssistantViewsInFlight;
       return;
     }
-    showAssistantViewLockUntil = now + SHOW_ASSISTANT_DEBOUNCE_MS;
-
     showAssistantViewsInFlight = (async () => {
+      try {
+        await vscode.commands.executeCommand('workbench.action.openView', 'quickActions');
+        return;
+      } catch {
+        // 继续降级到容器+聚焦命令
+      }
       try {
         await vscode.commands.executeCommand('workbench.view.extension.writing-agent');
         try {
           await vscode.commands.executeCommand('workbench.actions.treeView.quickActions.focus');
         } catch {
-          // 某些兼容层不支持该 focus 命令，容器已打开即可。
+          // 某些兼容层不支持 focus 命令，容器已打开即可。
+        }
+        return;
+      } catch {
+        // 继续降级
+      }
+      try {
+        await vscode.commands.executeCommand('workbench.action.openView', 'quickActionsExplorer');
+        try {
+          await vscode.commands.executeCommand('workbench.view.explorer');
+        } catch {
+          // 打开 Explorer 失败时不阻断，view 已可见即可。
+        }
+        return;
+      } catch {
+        // 继续降级
+      }
+      try {
+        await vscode.commands.executeCommand('workbench.view.explorer');
+        try {
+          await vscode.commands.executeCommand('workbench.actions.treeView.quickActionsExplorer.focus');
+        } catch {
+          // Explorer 已打开时不再调用 openView，避免触发 view quick-open。
         }
         return;
       } catch (primaryError) {
         const primaryMessage = primaryError instanceof Error ? primaryError.message : String(primaryError);
         try {
-          await vscode.commands.executeCommand('workbench.view.explorer');
-          try {
-            await vscode.commands.executeCommand('workbench.actions.treeView.quickActionsExplorer.focus');
-          } catch {
-            await vscode.commands.executeCommand('workbench.action.openView', 'quickActionsExplorer');
-          }
+          await vscode.commands.executeCommand('workbench.action.openView', 'quickActions');
           return;
         } catch (fallbackError) {
           const fallbackMessage = fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
@@ -1647,6 +1678,15 @@ export function activate(context: vscode.ExtensionContext): void {
     })();
 
     await showAssistantViewsInFlight;
+  });
+  registerSafeCommand(context, 'writingAgent.rewriteApplyReplace', async () => {
+    resolvePendingRewriteApplyDecision('replace');
+  });
+  registerSafeCommand(context, 'writingAgent.rewriteApplyInsertAfter', async () => {
+    resolvePendingRewriteApplyDecision('insertAfter');
+  });
+  registerSafeCommand(context, 'writingAgent.rewriteApplyCancel', async () => {
+    resolvePendingRewriteApplyDecision(undefined);
   });
 
   registerSafeCommand(context, 'writingAgent.refreshStyleProfile', async () => {
@@ -1766,6 +1806,71 @@ function resolveAiExecutionChannel(): AiExecutionChannel {
   return rawValue === 'ide-chat' ? 'ide-chat' : 'api';
 }
 
+function isCursorHost(commandSet: Set<string>): boolean {
+  const appName = (vscode.env.appName || '').toLowerCase();
+  if (appName.includes('cursor')) {
+    return true;
+  }
+  return (
+    commandSet.has('cursor.chat.insert')
+    || commandSet.has('cursor.chat.open')
+    || commandSet.has('cursor.chat.focusInput')
+  );
+}
+
+async function executeKnownCommand(
+  commandSet: Set<string>,
+  command: string,
+  args?: unknown
+): Promise<boolean> {
+  if (!commandSet.has(command)) {
+    return false;
+  }
+  try {
+    if (args === undefined) {
+      await vscode.commands.executeCommand(command);
+    } else {
+      await vscode.commands.executeCommand(command, args);
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function dispatchPromptToCursorChat(
+  normalizedPrompt: string,
+  commandSet: Set<string>
+): Promise<boolean> {
+  const focusAttempts: Array<{ command: string; args?: unknown }> = [
+    { command: 'cursor.chat.focusInput' },
+    { command: 'cursor.chat.open' },
+    { command: 'workbench.panel.chat.view.focus' },
+    { command: 'workbench.action.chat.open' }
+  ];
+  let focused = false;
+  for (const attempt of focusAttempts) {
+    if (await executeKnownCommand(commandSet, attempt.command, attempt.args)) {
+      focused = true;
+      break;
+    }
+  }
+
+  // Cursor 场景只允许向当前 Chat 输入框注入内容，禁止新建会话。
+  const insertAttempts: Array<{ command: string; args: unknown }> = [
+    { command: 'cursor.chat.insert', args: { text: normalizedPrompt } },
+    { command: 'cursor.chat.insert', args: normalizedPrompt },
+    { command: 'workbench.action.chat.insert', args: { text: normalizedPrompt } },
+    { command: 'workbench.action.chat.insert', args: normalizedPrompt }
+  ];
+  for (const attempt of insertAttempts) {
+    if (await executeKnownCommand(commandSet, attempt.command, attempt.args)) {
+      return true;
+    }
+  }
+  return focused;
+}
+
 async function dispatchPromptToIdeChat(prompt: string): Promise<boolean> {
   const normalized = prompt.trim();
   if (!normalized) {
@@ -1773,6 +1878,15 @@ async function dispatchPromptToIdeChat(prompt: string): Promise<boolean> {
   }
 
   const commandSet = new Set(await vscode.commands.getCommands(true));
+  if (isCursorHost(commandSet)) {
+    const inserted = await dispatchPromptToCursorChat(normalized, commandSet);
+    if (inserted) {
+      return true;
+    }
+    await vscode.env.clipboard.writeText(normalized);
+    return false;
+  }
+
   const promptAttempts: Array<{ command: string; args: unknown }> = [
     { command: 'workbench.action.chat.open', args: { query: normalized, isPartialQuery: true } },
     { command: 'workbench.action.chat.open', args: { query: normalized } },
@@ -1782,26 +1896,17 @@ async function dispatchPromptToIdeChat(prompt: string): Promise<boolean> {
     { command: 'workbench.action.quickchat.open', args: normalized },
     { command: 'vscode.chat.open', args: { query: normalized } },
     { command: 'vscode.chat.open', args: { inputValue: normalized } },
-    { command: 'cursor.chat.new', args: { query: normalized } },
     { command: 'cursor.chat.open', args: { query: normalized } },
     { command: 'codearts.agent.chat.open', args: { query: normalized } },
     { command: 'codearts.agent.chat.open', args: { inputValue: normalized } },
-    { command: 'codearts.agent.chat.new', args: { query: normalized } },
     { command: 'codearts.chat.open', args: { query: normalized } },
-    { command: 'codearts.chat.open', args: { inputValue: normalized } },
-    { command: 'codearts.chat.new', args: { query: normalized } }
+    { command: 'codearts.chat.open', args: { inputValue: normalized } }
   ];
   let opened = false;
 
   for (const attempt of promptAttempts) {
-    if (!commandSet.has(attempt.command)) {
-      continue;
-    }
-    try {
-      await vscode.commands.executeCommand(attempt.command, attempt.args);
+    if (await executeKnownCommand(commandSet, attempt.command, attempt.args)) {
       opened = true;
-    } catch {
-      // 尝试下一种宿主命令。
     }
   }
 
@@ -1819,15 +1924,9 @@ async function dispatchPromptToIdeChat(prompt: string): Promise<boolean> {
   ];
   let focused = false;
   for (const command of focusAttempts) {
-    if (!commandSet.has(command)) {
-      continue;
-    }
-    try {
-      await vscode.commands.executeCommand(command);
+    if (await executeKnownCommand(commandSet, command)) {
       focused = true;
       break;
-    } catch {
-      // 忽略聚焦失败，最终至少回退剪贴板。
     }
   }
 
@@ -1845,14 +1944,8 @@ async function dispatchPromptToIdeChat(prompt: string): Promise<boolean> {
       { command: 'workbench.action.quickchat.open', args: normalized }
     ];
     for (const attempt of insertAttempts) {
-      if (!commandSet.has(attempt.command)) {
-        continue;
-      }
-      try {
-        await vscode.commands.executeCommand(attempt.command, attempt.args);
+      if (await executeKnownCommand(commandSet, attempt.command, attempt.args)) {
         return true;
-      } catch {
-        // 回退到剪贴板。
       }
     }
   }
@@ -4892,27 +4985,97 @@ function chooseConclusion(body: string, conclusion: string, topic: string): stri
   return conclusionCandidate;
 }
 
+function resolveRewriteOverlayAnchor(
+  editor: vscode.TextEditor,
+  selectionRange: vscode.Range
+): vscode.Position {
+  const visible = editor.visibleRanges[0];
+  const hasVisible = Boolean(visible);
+  const linesAbove = hasVisible ? Math.max(0, selectionRange.start.line - visible.start.line) : selectionRange.start.line;
+  const linesBelow = hasVisible
+    ? Math.max(0, visible.end.line - selectionRange.end.line)
+    : Math.max(0, editor.document.lineCount - selectionRange.end.line - 1);
+  const preferAbove = linesAbove >= linesBelow;
+  return preferAbove ? selectionRange.start : selectionRange.end;
+}
+
+function clearRewriteApplyDecorations(): void {
+  if (!rewriteApplyDecorationType) {
+    return;
+  }
+  for (const editor of vscode.window.visibleTextEditors) {
+    editor.setDecorations(rewriteApplyDecorationType, []);
+  }
+}
+
+function sanitizeForMarkdownCodeBlock(text: string): string {
+  return (text || '').replace(/```/g, '``\\`');
+}
+
+function resolvePendingRewriteApplyDecision(mode: RewriteApplyMode | undefined): void {
+  const pending = pendingRewriteApplyDecision;
+  if (!pending) {
+    return;
+  }
+  pendingRewriteApplyDecision = null;
+  clearTimeout(pending.timeoutHandle);
+  clearRewriteApplyDecorations();
+  pending.resolve(mode);
+}
+
 async function pickRewriteApplyModeWithPreview(
+  editor: vscode.TextEditor,
+  selectionRange: vscode.Range,
   rewritten: string
 ): Promise<'replace' | 'insertAfter' | undefined> {
-  const previewLimit = 2600;
-  const preview =
-    rewritten.length > previewLimit
-      ? `${rewritten.slice(0, previewLimit)}\n\n（预览已截断，全文 ${rewritten.length} 字）`
-      : rewritten;
-  const action = await vscode.window.showInformationMessage(
-    '已生成改写文本，请确认应用方式。',
-    { modal: true, detail: preview },
-    '替换选区',
-    '插入到选区后'
-  );
-  if (action === '替换选区') {
+  resolvePendingRewriteApplyDecision(undefined);
+  if (!rewriteApplyDecorationType) {
     return 'replace';
   }
-  if (action === '插入到选区后') {
-    return 'insertAfter';
-  }
-  return undefined;
+
+  const previewLimit = 1800;
+  const previewText = rewritten.length > previewLimit
+    ? `${rewritten.slice(0, previewLimit)}\n\n（预览已截断，全文 ${rewritten.length} 字）`
+    : rewritten;
+  const previewBlock = sanitizeForMarkdownCodeBlock(previewText);
+  const markdown = new vscode.MarkdownString([
+    `已生成改写文本（${rewritten.length} 字）。`,
+    '',
+    '预览：',
+    '```text',
+    previewBlock,
+    '```',
+    '',
+    '[替换选区](command:writingAgent.rewriteApplyReplace) · [插入到选区后](command:writingAgent.rewriteApplyInsertAfter) · [取消](command:writingAgent.rewriteApplyCancel)'
+  ].join('\n'));
+  markdown.isTrusted = true;
+  markdown.supportHtml = false;
+
+  editor.setDecorations(rewriteApplyDecorationType, [
+    {
+      range: selectionRange,
+      hoverMessage: markdown
+    }
+  ]);
+
+  const anchor = resolveRewriteOverlayAnchor(editor, selectionRange);
+  void vscode.commands.executeCommand('editor.action.showHover', {
+    lineNumber: anchor.line + 1,
+    pos: anchor.character + 1
+  });
+
+  return new Promise<'replace' | 'insertAfter' | undefined>(resolve => {
+    const timeoutHandle = setTimeout(() => {
+      resolvePendingRewriteApplyDecision(undefined);
+      notifyWarn('改写应用选择已超时，未写入文稿。可重新执行“AI编辑选中文本”。');
+    }, REWRITE_APPLY_OVERLAY_TIMEOUT_MS);
+    pendingRewriteApplyDecision = {
+      editorUri: editor.document.uri.toString(),
+      selectionRange,
+      resolve,
+      timeoutHandle
+    };
+  });
 }
 
 function escapeHtml(value: string): string {

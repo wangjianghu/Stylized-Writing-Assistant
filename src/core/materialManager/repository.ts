@@ -25,6 +25,7 @@ export class MaterialRepository {
 
   private readonly preprocessor: TextPreprocessor;
   private readonly storageFilePath?: string;
+  private loaded = false;
   private materialsByStyle: Map<string, WritingMaterial[]>;
 
   constructor(private readonly context: vscode.ExtensionContext, storageRootPath?: string) {
@@ -32,27 +33,28 @@ export class MaterialRepository {
       this.storageFilePath = path.join(storageRootPath, 'data', 'materials.by-style.json');
     }
     this.preprocessor = new TextPreprocessor();
-    this.materialsByStyle = this.loadMaterialsByStyle();
-    if (this.storageFilePath && !fileExists(this.storageFilePath) && this.materialsByStyle.size > 0) {
-      void this.persist();
-    }
+    this.materialsByStyle = new Map<string, WritingMaterial[]>();
   }
 
   getAll(styleId: string): WritingMaterial[] {
+    this.ensureLoaded();
     return [...this.getBucket(styleId)];
   }
 
   getById(styleId: string, id: string): WritingMaterial | undefined {
+    this.ensureLoaded();
     return this.getBucket(styleId).find(material => material.id === id);
   }
 
   listRecent(styleId: string, limit: number = 10): WritingMaterial[] {
+    this.ensureLoaded();
     return [...this.getBucket(styleId)]
       .sort((a, b) => this.getTime(b.metadata.updatedAt) - this.getTime(a.metadata.updatedAt))
       .slice(0, Math.max(1, limit));
   }
 
   getTypeCounts(styleId: string): Map<MaterialType, number> {
+    this.ensureLoaded();
     const counts = new Map<MaterialType, number>();
     for (const material of this.getBucket(styleId)) {
       counts.set(material.type, (counts.get(material.type) || 0) + 1);
@@ -61,6 +63,7 @@ export class MaterialRepository {
   }
 
   async addMany(styleId: string, materials: WritingMaterial[]): Promise<number> {
+    this.ensureLoaded();
     const bucket = this.getBucket(styleId);
     let addedCount = 0;
 
@@ -90,6 +93,7 @@ export class MaterialRepository {
   }
 
   async addOneFromSelection(styleId: string, content: string, source: string): Promise<WritingMaterial> {
+    this.ensureLoaded();
     const cleanContent = content.trim();
     const type = cleanContent.length > 80 || cleanContent.includes('\n')
       ? MaterialType.PARAGRAPH
@@ -130,6 +134,7 @@ export class MaterialRepository {
   }
 
   async markUsed(styleId: string, id: string): Promise<void> {
+    this.ensureLoaded();
     const material = this.getById(styleId, id);
     if (!material) {
       return;
@@ -142,6 +147,7 @@ export class MaterialRepository {
   }
 
   search(styleId: string, query: SearchQuery): WritingMaterial[] {
+    this.ensureLoaded();
     const materials = this.getBucket(styleId);
     const limit = Math.max(1, query.limit || 50);
     const normalizedKeywords = this.normalizeKeywords(query.keywords, query.semantic);
@@ -192,6 +198,7 @@ export class MaterialRepository {
   }
 
   async deleteStyleMaterials(styleId: string): Promise<void> {
+    this.ensureLoaded();
     this.materialsByStyle.delete(styleId);
     await this.persist();
   }
@@ -200,6 +207,7 @@ export class MaterialRepository {
     sourceStyleId: string,
     targetStyleId: string
   ): Promise<{ moved: number; merged: number }> {
+    this.ensureLoaded();
     if (!sourceStyleId || !targetStyleId || sourceStyleId === targetStyleId) {
       return { moved: 0, merged: 0 };
     }
@@ -236,7 +244,19 @@ export class MaterialRepository {
     return { moved, merged };
   }
 
+  private ensureLoaded(): void {
+    if (this.loaded) {
+      return;
+    }
+    this.loaded = true;
+    this.materialsByStyle = this.loadMaterialsByStyle();
+    if (this.storageFilePath && !fileExists(this.storageFilePath) && this.materialsByStyle.size > 0) {
+      void this.persist();
+    }
+  }
+
   private getBucket(styleId: string): WritingMaterial[] {
+    this.ensureLoaded();
     const existing = this.materialsByStyle.get(styleId);
     if (existing) {
       const cleaned = existing.filter(material => this.isMeaningfulContent(material.content, 8));
