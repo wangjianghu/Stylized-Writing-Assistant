@@ -1,5 +1,6 @@
 import * as https from 'https';
 import { URL } from 'url';
+import * as zlib from 'zlib';
 
 export interface OpenAiCompatibleOptions {
   apiKey: string;
@@ -19,6 +20,12 @@ export interface OpenAiCompatibleResult {
     completionTokens?: number;
     totalTokens?: number;
   };
+}
+
+export interface OpenAiCompatibleModelListOptions {
+  apiKey: string;
+  baseUrl: string;
+  timeoutMs: number;
 }
 
 interface OpenAiLikeChoice {
@@ -95,6 +102,20 @@ function normalizeEndpoint(baseUrl: string): string {
     return trimmed;
   }
   return `${trimmed}/chat/completions`;
+}
+
+function normalizeModelsEndpoint(baseUrl: string): string {
+  const trimmed = baseUrl.trim().replace(/\/+$/g, '');
+  if (!trimmed) {
+    throw new Error('API 地址为空');
+  }
+  if (trimmed.endsWith('/models')) {
+    return trimmed;
+  }
+  if (trimmed.endsWith('/chat/completions')) {
+    return `${trimmed.slice(0, -('/chat/completions'.length))}/models`;
+  }
+  return `${trimmed}/models`;
 }
 
 function collectTextParts(value: unknown, depth = 0): string[] {
@@ -216,6 +237,96 @@ function parseResponseBody(body: string): OpenAiCompatibleResult {
   };
 }
 
+function isOpenRouterEndpoint(url: URL): boolean {
+  return /(^|\.)openrouter\.ai$/i.test(url.hostname);
+}
+
+function decodeResponseBody(payload: Buffer, contentEncoding: string | undefined): string {
+  const normalized = (contentEncoding || '').toLowerCase();
+  try {
+    if (normalized.includes('gzip')) {
+      return zlib.gunzipSync(payload).toString('utf8');
+    }
+    if (normalized.includes('br')) {
+      return zlib.brotliDecompressSync(payload).toString('utf8');
+    }
+    if (normalized.includes('deflate')) {
+      return zlib.inflateSync(payload).toString('utf8');
+    }
+  } catch {
+    // 解压失败时回退到 utf8 直接解析，避免丢失原始错误信息
+  }
+  return payload.toString('utf8');
+}
+
+function extractModelName(value: unknown): string | null {
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    return trimmed || null;
+  }
+  if (!value || typeof value !== 'object') {
+    return null;
+  }
+  const objectValue = value as Record<string, unknown>;
+  const fromId = typeof objectValue.id === 'string' ? objectValue.id.trim() : '';
+  if (fromId) {
+    return fromId;
+  }
+  const fromModel = typeof objectValue.model === 'string' ? objectValue.model.trim() : '';
+  if (fromModel) {
+    return fromModel;
+  }
+  const fromName = typeof objectValue.name === 'string' ? objectValue.name.trim() : '';
+  if (fromName) {
+    return fromName;
+  }
+  return null;
+}
+
+function collectModelNames(value: unknown, depth = 0): string[] {
+  if (value == null || depth > 6) {
+    return [];
+  }
+  if (Array.isArray(value)) {
+    return value.flatMap(item => {
+      const name = extractModelName(item);
+      if (name) {
+        return [name];
+      }
+      return collectModelNames(item, depth + 1);
+    });
+  }
+  if (typeof value !== 'object') {
+    return [];
+  }
+
+  const objectValue = value as Record<string, unknown>;
+  const direct = extractModelName(objectValue);
+  if (direct) {
+    return [direct];
+  }
+  const preferredKeys = ['data', 'models', 'items', 'result', 'results', 'list'];
+  const preferred = preferredKeys.flatMap(key => collectModelNames(objectValue[key], depth + 1));
+  if (preferred.length > 0) {
+    return preferred;
+  }
+  return Object.values(objectValue).flatMap(item => collectModelNames(item, depth + 1));
+}
+
+function uniqueModelNames(models: string[]): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const model of models) {
+    const trimmed = model.trim();
+    if (!trimmed || seen.has(trimmed)) {
+      continue;
+    }
+    seen.add(trimmed);
+    result.push(trimmed);
+  }
+  return result;
+}
+
 export async function generateWithOpenAiCompatibleApi(
   options: OpenAiCompatibleOptions
 ): Promise<OpenAiCompatibleResult> {
@@ -235,6 +346,19 @@ export async function generateWithOpenAiCompatibleApi(
   });
 
   return new Promise<OpenAiCompatibleResult>((resolve, reject) => {
+    const headers: Record<string, string | number> = {
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(body),
+      Authorization: `Bearer ${options.apiKey}`,
+      Accept: 'application/json',
+      'Accept-Encoding': 'identity',
+      'User-Agent': 'writing-agent/0.0.2'
+    };
+    if (isOpenRouterEndpoint(url)) {
+      headers['HTTP-Referer'] = process.env.WRITING_AGENT_OPENROUTER_REFERER || 'https://github.com/daydayup2026/writing-agent';
+      headers['X-Title'] = process.env.WRITING_AGENT_OPENROUTER_TITLE || 'writing-agent';
+    }
+
     const request = https.request(
       {
         protocol: url.protocol,
@@ -242,11 +366,7 @@ export async function generateWithOpenAiCompatibleApi(
         port: url.port || undefined,
         path: `${url.pathname}${url.search}`,
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Content-Length': Buffer.byteLength(body),
-          Authorization: `Bearer ${options.apiKey}`
-        },
+        headers,
         timeout: options.timeoutMs
       },
       response => {
@@ -261,7 +381,7 @@ export async function generateWithOpenAiCompatibleApi(
 
         response.on('end', () => {
           const statusCode = response.statusCode || 0;
-          const payload = Buffer.concat(chunks).toString('utf8');
+          const payload = decodeResponseBody(Buffer.concat(chunks), response.headers['content-encoding']);
           if (statusCode >= 400) {
             reject(new Error(`API 请求失败（HTTP ${statusCode}）：${payload.slice(0, 300)}`));
             return;
@@ -285,6 +405,87 @@ export async function generateWithOpenAiCompatibleApi(
     });
 
     request.write(body);
+    request.end();
+  });
+}
+
+export async function listOpenAiCompatibleModels(
+  options: OpenAiCompatibleModelListOptions
+): Promise<string[]> {
+  const endpoint = normalizeModelsEndpoint(options.baseUrl);
+  const url = new URL(endpoint);
+
+  return new Promise<string[]>((resolve, reject) => {
+    const headers: Record<string, string | number> = {
+      Authorization: `Bearer ${options.apiKey}`,
+      Accept: 'application/json',
+      'Accept-Encoding': 'identity',
+      'User-Agent': 'writing-agent/0.0.2'
+    };
+    if (isOpenRouterEndpoint(url)) {
+      headers['HTTP-Referer'] = process.env.WRITING_AGENT_OPENROUTER_REFERER || 'https://github.com/daydayup2026/writing-agent';
+      headers['X-Title'] = process.env.WRITING_AGENT_OPENROUTER_TITLE || 'writing-agent';
+    }
+
+    const request = https.request(
+      {
+        protocol: url.protocol,
+        hostname: url.hostname,
+        port: url.port || undefined,
+        path: `${url.pathname}${url.search}`,
+        method: 'GET',
+        headers,
+        timeout: options.timeoutMs
+      },
+      response => {
+        const chunks: Buffer[] = [];
+        response.on('data', chunk => {
+          if (typeof chunk === 'string') {
+            chunks.push(Buffer.from(chunk, 'utf8'));
+            return;
+          }
+          chunks.push(chunk);
+        });
+
+        response.on('end', () => {
+          const statusCode = response.statusCode || 0;
+          const payload = decodeResponseBody(Buffer.concat(chunks), response.headers['content-encoding']);
+          if (statusCode >= 400) {
+            reject(new Error(`模型列表请求失败（HTTP ${statusCode}）：${payload.slice(0, 300)}`));
+            return;
+          }
+
+          let parsed: Record<string, unknown>;
+          try {
+            parsed = JSON.parse(payload) as Record<string, unknown>;
+          } catch {
+            reject(new Error(`模型列表返回非 JSON：${payload.slice(0, 200)}`));
+            return;
+          }
+
+          const errorNode = parsed.error as { message?: unknown } | undefined;
+          const errorMessage = typeof errorNode?.message === 'string' ? errorNode.message.trim() : '';
+          if (errorMessage) {
+            reject(new Error(`模型列表请求失败：${errorMessage}`));
+            return;
+          }
+
+          const models = uniqueModelNames(
+            collectModelNames(parsed.data).concat(collectModelNames(parsed.models))
+          );
+          resolve(models);
+        });
+      }
+    );
+
+    request.on('timeout', () => {
+      request.destroy(new Error(`模型列表请求超时（>${options.timeoutMs}ms）`));
+    });
+
+    request.on('error', error => {
+      reject(error);
+    });
+
     request.end();
   });
 }

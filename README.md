@@ -81,8 +81,14 @@
 | :--- | :--- | :--- |
 | `writingAgent.storage.path` | 插件内容（风格、素材、文集）存储根目录 | `~/Downloads/writing-angent` |
 | `writingAgent.ai.channel` | AI 通道（可选 `api` 或 `ide-chat`） | `api` |
+| `writingAgent.api.provider` | API 提供商（新增支持 `openrouter`） | `iflow` |
+| `writingAgent.api.baseUrl` | 统一 API 地址（OpenAI 兼容） | `https://apis.iflow.cn/v1` |
+| `writingAgent.api.model` | 主模型（兼容旧配置） | `Qwen/Qwen3-8B` |
+| `writingAgent.api.models` | 多模型列表（按顺序自动轮换） | `[]` |
 | `writingAgent.autoExtract` | 是否在导入文章时自动提取素材 | `true` |
 | `writingAgent.suggestionMinChars` | 自动补全触发所需的最小字符数 (2~20) | `6` |
+
+> 使用 OpenRouter 时，可直接配置默认模型 `stepfun/step-3.5-flash:free`，并在 `writingAgent.api.models` 中追加备用模型实现故障顺序切换。
 
 ---
 

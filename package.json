@@ -20,8 +20,6 @@
     "AI"
   ],
   "activationEvents": [
-    "*",
-    "onStartupFinished",
     "onCommand:writingAgent.generateArticle",
     "onCommand:writingAgent.saveMaterial",
     "onCommand:writingAgent.analyzeStyle",
@@ -52,6 +50,8 @@
     "onView:articleCollectionExplorer",
     "onCommand:writingAgent.applyClipboardToDraft",
     "onCommand:writingAgent.configureApi",
+    "onCommand:writingAgent.reorderApiProviders",
+    "onCommand:writingAgent.reorderApiModels",
     "onCommand:writingAgent.configureSuggestionMinChars",
     "onCommand:writingAgent.deleteArticle",
     "onCommand:writingAgent.testApiConnection"
@@ -162,6 +162,16 @@
         "command": "writingAgent.configureApi",
         "title": "写作助手: 配置 API",
         "shortTitle": "配置 API"
+      },
+      {
+        "command": "writingAgent.reorderApiProviders",
+        "title": "写作助手: 拖拽调整 API 提供商顺序",
+        "shortTitle": "提供商顺序"
+      },
+      {
+        "command": "writingAgent.reorderApiModels",
+        "title": "写作助手: 拖拽调整 API 模型顺序",
+        "shortTitle": "模型顺序"
       },
       {
         "command": "writingAgent.configureSuggestionMinChars",
@@ -654,7 +664,7 @@
           "type": "string",
           "default": "",
           "scope": "application",
-          "description": "插件内容存储根目录（文集、素材库、样本学习数据）。留空时默认使用 ~/Downloads/writing-angent"
+          "description": "插件内容存储根目录（文集、素材库、样本学习数据）。留空优先使用 ~/Downloads/writing-angent；若无权限会自动回退到扩展全局存储目录"
         },
         "writingAgent.ai.channel": {
           "type": "string",
@@ -725,6 +735,7 @@
           "default": "iflow",
           "enum": [
             "iflow",
+            "openrouter",
             "kimi",
             "deepseek",
             "minimax",
@@ -733,6 +744,7 @@
           ],
           "enumDescriptions": [
             "心流",
+            "OpenRouter",
             "Kimi",
             "DeepSeek",
             "MiniMax",
@@ -740,6 +752,14 @@
             "自定义 OpenAI 兼容"
           ],
           "description": "当前启用的 API 提供商"
+        },
+        "writingAgent.api.providerOrder": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "API 提供商调用顺序（按数组顺序依次尝试）"
         },
         "writingAgent.api.baseUrl": {
           "type": "string",
@@ -750,6 +770,19 @@
           "type": "string",
           "default": "Qwen/Qwen3-8B",
           "description": "统一 API 模型名称"
+        },
+        "writingAgent.api.models": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "统一 API 模型列表（按优先级顺序轮换，首项优先）"
+        },
+        "writingAgent.api.providerConfigs": {
+          "type": "object",
+          "default": {},
+          "description": "各 API 提供商的独立模型与地址配置缓存（由命令自动维护）"
         },
         "writingAgent.api.temperature": {
           "type": "number",

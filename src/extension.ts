@@ -12,7 +12,7 @@ import { generateStyleAlignedDraft } from './core/articleManager/generator';
 import { humanizeZh } from './core/articleManager/humanizerZh';
 import {
   generateWithOpenAiCompatibleApi,
-  isModelNotSupportedApiError
+  listOpenAiCompatibleModels
 } from './core/articleManager/openAiCompatibleClient';
 import { MaterialSearchPanel } from './panels/materialSearchPanel';
 import { MaterialLibraryProvider } from './providers/materialLibraryProvider';
@@ -34,7 +34,7 @@ type ImportTargetDecision =
   | { mode: 'create'; createName: string }
   | { mode: 'update'; profileId: string };
 
-type ApiProvider = 'iflow' | 'kimi' | 'deepseek' | 'minimax' | 'qwen' | 'custom';
+type ApiProvider = 'iflow' | 'openrouter' | 'kimi' | 'deepseek' | 'minimax' | 'qwen' | 'custom';
 type TopicOutputMode = 'article' | 'outline';
 type AiExecutionChannel = 'api' | 'ide-chat';
 
@@ -45,12 +45,23 @@ interface ProviderPreset {
   defaultModel: string;
 }
 
-interface RuntimeApiSettings {
-  enabled: boolean;
+interface RuntimeProviderCandidate {
   provider: ApiProvider;
   apiKey: string;
   baseUrl: string;
   model: string;
+  models: string[];
+}
+
+interface RuntimeApiSettings {
+  enabled: boolean;
+  provider: ApiProvider;
+  providerOrder: ApiProvider[];
+  providerCandidates: RuntimeProviderCandidate[];
+  apiKey: string;
+  baseUrl: string;
+  model: string;
+  models: string[];
   temperature: number;
   maxTokens: number;
   timeoutMs: number;
@@ -58,8 +69,10 @@ interface RuntimeApiSettings {
 
 interface ApiGenerationResult {
   content: string;
+  provider: ApiProvider;
   model: string;
   fallbackUsed: boolean;
+  fallbackFromProvider?: ApiProvider;
   fallbackFromModel?: string;
 }
 
@@ -68,6 +81,11 @@ interface ApiValidationState {
   valid: boolean;
   message: string;
   checkedAt: string;
+}
+
+interface StorageRootResolutionCache {
+  preferredPath: string;
+  resolvedPath: string;
 }
 
 interface DeleteStyleArticlesResult {
@@ -115,14 +133,18 @@ type MammothModule = {
 
 const LEGACY_IFLOW_SECRET_KEY = 'writingAgent.iflow.apiKey';
 const API_VALIDATION_STATE_KEY = 'writingAgent.api.validation.v1';
+const STORAGE_ROOT_RESOLUTION_CACHE_KEY = 'writingAgent.storage.resolvedRoot.v1';
 const COLLECTION_RELATIVE_PREFIX = '文集';
 const LEGACY_COLLECTION_RELATIVE_PREFIX = '.writing-agent/文集';
 const STORAGE_DATA_RELATIVE_PREFIX = 'data';
 const STORAGE_DEFAULT_DIR_NAME = 'writing-angent';
 const STATUS_MESSAGE_TIMEOUT_MS = 5000;
-const SHOW_ASSISTANT_DEBOUNCE_MS = 1200;
+const SHOW_ASSISTANT_DEBOUNCE_MS = 250;
 const SUGGESTION_CACHE_TTL_MS = 20_000;
 const COMPLETION_MAX_ITEMS = 6;
+const API_VALIDATION_TIMEOUT_MIN_MS = 8000;
+const API_VALIDATION_TIMEOUT_MAX_MS = 30000;
+const DEFERRED_BOOTSTRAP_DELAY_MS = 1200;
 const COMPLETION_DOCUMENT_SELECTOR: vscode.DocumentSelector = [
   { scheme: 'file', language: 'markdown' },
   { scheme: 'untitled', language: 'markdown' },
@@ -133,12 +155,20 @@ const COMPLETION_TRIGGER_CHARACTERS = [' ', '，', '。', '；', '：', ',', '.'
 let showAssistantViewLockUntil = 0;
 let showAssistantViewsInFlight: Promise<void> | null = null;
 let cachedMammothModule: MammothModule | null | undefined;
+let activeExtensionContext: vscode.ExtensionContext | null = null;
+let storageRootPathCache: string | null = null;
 const PROVIDER_PRESETS: Record<ApiProvider, ProviderPreset> = {
   iflow: {
     provider: 'iflow',
     displayName: '心流',
     defaultBaseUrl: 'https://apis.iflow.cn/v1',
     defaultModel: 'Qwen/Qwen3-8B'
+  },
+  openrouter: {
+    provider: 'openrouter',
+    displayName: 'OpenRouter',
+    defaultBaseUrl: 'https://openrouter.ai/api/v1',
+    defaultModel: 'stepfun/step-3.5-flash:free'
   },
   kimi: {
     provider: 'kimi',
@@ -177,6 +207,8 @@ export function activate(context: vscode.ExtensionContext): void {
   console.log(`[writing-agent] vscode.version=${vscode.version}`);
   console.log(`[writing-agent] extensionPath=${context.extensionPath}`);
 
+  activeExtensionContext = context;
+  storageRootPathCache = null;
   const storageRootPath = resolveStorageRootPath();
   const styleEngine = new StyleEngine();
   const materialExtractor = new MaterialExtractor();
@@ -188,18 +220,19 @@ export function activate(context: vscode.ExtensionContext): void {
     if (!settings || !settings.enabled) {
       return { configured: false, text: '已关闭', iconId: 'circle-slash' };
     }
-    if (settings.apiKey) {
+    if (hasAnyApiProviderKey(settings)) {
       const providerName = PROVIDER_PRESETS[settings.provider].displayName;
+      const modelLabel = formatModelChainLabel(settings.models);
       const fingerprint = buildApiValidationFingerprint(settings);
       const validation = loadApiValidationState(context);
       if (!validation || validation.fingerprint !== fingerprint) {
-        return { configured: true, text: `已配置·${providerName}/${settings.model}·未测试`, iconId: 'warning' };
+        return { configured: true, text: `已配置·${providerName}/${modelLabel}·未测试`, iconId: 'warning' };
       }
       if (validation.valid) {
-        return { configured: true, text: `已配置·${providerName}/${settings.model}·有效`, iconId: 'check' };
+        return { configured: true, text: `已配置·${providerName}/${modelLabel}·有效`, iconId: 'check' };
       }
       const brief = summarizeError(validation.message, 36);
-      return { configured: true, text: `已配置·${providerName}/${settings.model}·无效（${brief}）`, iconId: 'error' };
+      return { configured: true, text: `已配置·${providerName}/${modelLabel}·无效（${brief}）`, iconId: 'error' };
     }
     return { configured: false, text: '未配置', iconId: 'warning' };
   });
@@ -255,44 +288,47 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.window.registerTreeDataProvider('materialLibraryExplorer', materialLibraryProvider),
     vscode.window.registerTreeDataProvider('styleProfileExplorer', styleProfileProvider)
   );
-  context.subscriptions.push(
-    vscode.languages.registerCompletionItemProvider(
-      COMPLETION_DOCUMENT_SELECTOR,
-      {
-        async provideCompletionItems(document, position) {
-          const linePrefix = document.lineAt(position.line).text.slice(0, position.character);
-          const minTriggerChars = getSuggestionMinChars();
-          const query = extractSuggestionQuery(linePrefix);
-          if (!query || query.length < minTriggerChars) {
-            return [];
-          }
+  const deferredLanguageFeaturesTimer = setTimeout(() => {
+    context.subscriptions.push(
+      vscode.languages.registerCompletionItemProvider(
+        COMPLETION_DOCUMENT_SELECTOR,
+        {
+          async provideCompletionItems(document, position) {
+            const linePrefix = document.lineAt(position.line).text.slice(0, position.character);
+            const minTriggerChars = getSuggestionMinChars();
+            const query = extractSuggestionQuery(linePrefix);
+            if (!query || query.length < minTriggerChars) {
+              return [];
+            }
 
-          const matched = await collectCompletionSuggestions(
-            query,
-            styleRepository,
-            materialRepository,
-            articleRepository,
-            suggestionBucketCache
-          );
-          if (matched.length === 0) {
-            return [];
-          }
+            const matched = await collectCompletionSuggestions(
+              query,
+              styleRepository,
+              materialRepository,
+              articleRepository,
+              suggestionBucketCache
+            );
+            if (matched.length === 0) {
+              return [];
+            }
 
-          const replaceRange = resolveSuggestionReplaceRange(document, position, query);
-          return matched.map((entry, index) => createCompletionItem(entry, index, replaceRange));
-        }
-      },
-      ...COMPLETION_TRIGGER_CHARACTERS
-    ),
-    vscode.workspace.onDidChangeTextDocument(event => {
-      scheduleSuggestionTrigger(event, suggestionTriggerTimers);
-    }),
-    {
-      dispose: () => {
-        clearSuggestionTimers();
-      }
+            const replaceRange = resolveSuggestionReplaceRange(document, position, query);
+            return matched.map((entry, index) => createCompletionItem(entry, index, replaceRange));
+          }
+        },
+        ...COMPLETION_TRIGGER_CHARACTERS
+      ),
+      vscode.workspace.onDidChangeTextDocument(event => {
+        scheduleSuggestionTrigger(event, suggestionTriggerTimers);
+      })
+    );
+  }, DEFERRED_BOOTSTRAP_DELAY_MS);
+  context.subscriptions.push({
+    dispose: () => {
+      clearTimeout(deferredLanguageFeaturesTimer);
+      clearSuggestionTimers();
     }
-  );
+  });
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration(event => {
       if (
@@ -303,6 +339,7 @@ export function activate(context: vscode.ExtensionContext): void {
         quickEntryProvider.refresh();
       }
       if (event.affectsConfiguration('writingAgent.storage.path')) {
+        storageRootPathCache = null;
         void ensureStorageDirectories().catch(error => {
           const message = error instanceof Error ? error.message : String(error);
           vscode.window.showErrorMessage(`写作助手存储目录初始化失败：${message}`);
@@ -324,18 +361,23 @@ export function activate(context: vscode.ExtensionContext): void {
       }
     })
   );
-  void (async () => {
-    try {
-      await ensureStorageDirectories();
-      await migrateLegacyCollectionDirectory(articleRepository);
-      await syncArticleCollectionWithDisk(articleRepository, articleCollectionProvider);
-      articleCollectionProvider.refresh();
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      console.error('[writing-agent] 初始化文集目录失败', message);
-      notifyWarn(`初始化文集目录失败：${message}`);
-    }
-  })();
+  const bootstrapTimer = setTimeout(() => {
+    void (async () => {
+      try {
+        await ensureStorageDirectories();
+        await migrateLegacyCollectionDirectory(articleRepository);
+        await syncArticleCollectionWithDisk(articleRepository, articleCollectionProvider);
+        articleCollectionProvider.refresh();
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error('[writing-agent] 初始化文集目录失败', message);
+        notifyWarn(`初始化文集目录失败：${message}`);
+      }
+    })();
+  }, DEFERRED_BOOTSTRAP_DELAY_MS);
+  context.subscriptions.push({
+    dispose: () => clearTimeout(bootstrapTimer)
+  });
 
   registerSafeCommand(context, 'writingAgent.generateArticle', async () => {
     const currentStyle = styleEngine.getCurrentStyle();
@@ -429,7 +471,7 @@ export function activate(context: vscode.ExtensionContext): void {
         if (executionChannel === 'ide-chat') {
           progress.report({ increment: 78, message: '填充 IDE Chat 提示词...' });
           await routePromptToHostChat();
-        } else if (apiSettings?.enabled && apiSettings.apiKey) {
+        } else if (apiSettings?.enabled && hasAnyApiProviderKey(apiSettings)) {
           try {
             progress.report({ increment: 78, message: outputMode === 'outline' ? '调用 API 生成提纲...' : '调用 API 生成正文...' });
             const apiResult = await generateWithFallbackModel(apiSettings, aiPrompt);
@@ -445,13 +487,12 @@ export function activate(context: vscode.ExtensionContext): void {
               generatedBody = parsed.body;
               generatedConclusion = parsed.conclusion;
             }
-            const providerName = PROVIDER_PRESETS[apiSettings.provider].displayName;
+            const providerName = PROVIDER_PRESETS[apiResult.provider].displayName;
             sourceLabel = `${providerName} API · ${apiResult.model}`;
-            aiCommand = `${apiSettings.provider}:${apiResult.model}`;
-            if (apiResult.fallbackUsed && apiResult.fallbackFromModel) {
-              notifyWarn(
-                `当前模型“${apiResult.fallbackFromModel}”不受支持，已自动改用“${apiResult.model}”。`
-              );
+            aiCommand = `${apiResult.provider}:${apiResult.model}`;
+            const fallbackNotice = buildApiFallbackNotice(apiResult);
+            if (fallbackNotice) {
+              notifyWarn(fallbackNotice);
             }
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
@@ -1118,7 +1159,9 @@ export function activate(context: vscode.ExtensionContext): void {
       return;
     }
 
-    const selectedText = editor.document.getText(editor.selection).trim();
+    const selectionRange = new vscode.Range(editor.selection.start, editor.selection.end);
+    const selectedRaw = editor.document.getText(selectionRange);
+    const selectedText = selectedRaw.trim();
     if (!selectedText) {
       notifyWarn('选中文本为空，无法执行改写。');
       return;
@@ -1148,7 +1191,6 @@ export function activate(context: vscode.ExtensionContext): void {
 
     const active = styleRepository.getActiveProfile();
     const style = active?.style || styleEngine.getCurrentStyle() || undefined;
-    const selectionRange = new vscode.Range(editor.selection.start, editor.selection.end);
     const prompt = buildSelectionRewritePrompt(
       selectedText,
       customInstruction.trim(),
@@ -1171,7 +1213,7 @@ export function activate(context: vscode.ExtensionContext): void {
       notifyWarn('API 已关闭，请先开启后再试。');
       return;
     }
-    if (!settings.apiKey) {
+    if (!hasAnyApiProviderKey(settings)) {
       const action = await vscode.window.showWarningMessage(
         '未配置 API Key。是否改用 IDE AI 对话，或先配置 API？',
         '改用 IDE AI 对话',
@@ -1194,7 +1236,13 @@ export function activate(context: vscode.ExtensionContext): void {
 
     try {
       let rewritten = '';
-      let fallbackInfo: { from: string; to: string } | undefined;
+      let fallbackInfo: ApiGenerationResult | undefined;
+      let usedStrictRetry = false;
+      const recordFallback = (result: ApiGenerationResult): void => {
+        if (result.fallbackUsed) {
+          fallbackInfo = result;
+        }
+      };
       await vscode.window.withProgress(
         {
           location: vscode.ProgressLocation.Window,
@@ -1205,15 +1253,28 @@ export function activate(context: vscode.ExtensionContext): void {
           progress.report({ increment: 20, message: '调用 API...' });
           const result = await generateWithFallbackModel(settings, prompt);
           rewritten = normalizeRewriteOutput(result.content);
+          recordFallback(result);
+
           if (!rewritten) {
             throw new Error('API 返回为空，未生成可替换内容');
           }
-          if (result.fallbackUsed && result.fallbackFromModel) {
-            fallbackInfo = {
-              from: result.fallbackFromModel,
-              to: result.model
-            };
+
+          if (isRewriteEffectivelyUnchanged(selectedRaw, rewritten)) {
+            progress.report({ increment: 45, message: '结果与原文接近，自动强制改写重试...' });
+            const strictPrompt = buildStrictRewritePrompt(prompt, selectedRaw);
+            const strictResult = await generateWithFallbackModel(settings, strictPrompt);
+            rewritten = normalizeRewriteOutput(strictResult.content);
+            usedStrictRetry = true;
+            recordFallback(strictResult);
           }
+
+          if (!rewritten) {
+            throw new Error('API 返回为空，未生成可替换内容');
+          }
+          if (isRewriteEffectivelyUnchanged(selectedRaw, rewritten)) {
+            throw new Error('改写结果与原文几乎一致，未产生有效修改。请更换指令后重试。');
+          }
+
           progress.report({ increment: 100, message: '完成' });
         }
       );
@@ -1237,7 +1298,13 @@ export function activate(context: vscode.ExtensionContext): void {
       }
 
       if (fallbackInfo) {
-        notifyWarn(`当前模型“${fallbackInfo.from}”不受支持，已自动改用“${fallbackInfo.to}”。`);
+        const fallbackNotice = buildApiFallbackNotice(fallbackInfo);
+        if (fallbackNotice) {
+          notifyWarn(fallbackNotice);
+        }
+      }
+      if (usedStrictRetry) {
+        notifyInfo('检测到首轮改写与原文过于接近，已自动执行二次强制改写。');
       }
 
       if (outputMode === 'replace') {
@@ -1278,11 +1345,24 @@ export function activate(context: vscode.ExtensionContext): void {
       [
         { label: '设置/更新 API Key', value: 'setKey' },
         { label: '清除 API Key', value: 'clearKey' },
-        { label: '仅修改模型与地址', value: 'configOnly' }
+        { label: '仅修改模型与地址', value: 'configOnly' },
+        { label: '调整 API 提供商顺序', value: 'providerOrder' }
       ],
       { placeHolder: `配置 API（${preset.displayName}）` }
     );
     if (!action) {
+      return;
+    }
+
+    if (action.value === 'providerOrder') {
+      const configuredOrder = getConfiguredProviderOrder(config, currentProvider);
+      const reordered = await editProviderOrderByDrag('API 提供商顺序', configuredOrder);
+      if (!reordered || reordered.length === 0) {
+        return;
+      }
+      await updateProviderOrderConfig(reordered, target);
+      notifyInfo('API 提供商顺序已更新，调用将按从上到下依次尝试。');
+      quickEntryProvider.refresh();
       return;
     }
 
@@ -1323,24 +1403,77 @@ export function activate(context: vscode.ExtensionContext): void {
       return;
     }
 
-    const modelDefault = provider === currentProvider && current?.model
-      ? current.model
-      : preset.defaultModel;
-    const modelInput = await vscode.window.showInputBox({
-      prompt: `模型名称（${preset.displayName}）`,
-      value: modelDefault
-    });
-    if (modelInput === undefined) {
+    const defaultModels = provider === currentProvider && current?.models?.length
+      ? current.models
+      : [preset.defaultModel];
+    const apiKey = await resolveProviderApiKey(context, provider);
+    let selectedModels: string[] | undefined;
+    if (provider === 'iflow' || provider === 'openrouter') {
+      const mode = await vscode.window.showQuickPick(
+        [
+          { label: '从模型列表选择（推荐）', value: 'pick' },
+          { label: '手动输入模型名称', value: 'manual' }
+        ],
+        { placeHolder: `配置 ${preset.displayName} 模型` }
+      );
+      if (!mode) {
+        return;
+      }
+      if (mode.value === 'pick') {
+        selectedModels = await pickProviderModelCandidates(
+          preset.displayName,
+          apiKey,
+          baseUrlInput.trim() || preset.defaultBaseUrl,
+          defaultModels,
+          15000
+        );
+        if (!selectedModels) {
+          const fallbackAction = await vscode.window.showWarningMessage(
+            '未选择模型，是否改为手动输入？',
+            '手动输入'
+          );
+          if (fallbackAction !== '手动输入') {
+            return;
+          }
+          selectedModels = await promptManualModelCandidates(preset.displayName, defaultModels);
+        }
+      } else {
+        selectedModels = await promptManualModelCandidates(preset.displayName, defaultModels);
+      }
+    } else {
+      selectedModels = await promptManualModelCandidates(preset.displayName, defaultModels);
+    }
+    if (!selectedModels) {
       return;
+    }
+    const pickedModels = selectedModels.length > 0 ? selectedModels : [preset.defaultModel];
+    let normalizedModels = pickedModels;
+    if (pickedModels.length > 1) {
+      const reorder = await editModelOrderByDrag(`${preset.displayName} 模型顺序`, pickedModels);
+      if (reorder) {
+        normalizedModels = reorder;
+      }
     }
 
     await config.update('api.enabled', true, target);
     await config.update('api.provider', provider, target);
-    await config.update('api.baseUrl', baseUrlInput.trim() || preset.defaultBaseUrl, target);
-    await config.update('api.model', modelInput.trim() || preset.defaultModel, target);
+    const normalizedBaseUrl = baseUrlInput.trim() || preset.defaultBaseUrl;
+    await config.update('api.baseUrl', normalizedBaseUrl, target);
+    await config.update('api.model', normalizedModels[0], target);
+    await config.update('api.models', normalizedModels, target);
+    const rawProviderConfigs = config.get<unknown>('api.providerConfigs', {});
+    const providerConfigs = rawProviderConfigs && typeof rawProviderConfigs === 'object'
+      ? { ...(rawProviderConfigs as Record<string, unknown>) }
+      : {};
+    providerConfigs[provider] = {
+      baseUrl: normalizedBaseUrl,
+      model: normalizedModels[0],
+      models: normalizedModels
+    };
+    await config.update('api.providerConfigs', providerConfigs, target);
 
     const latest = await resolveApiSettings(context);
-    if (latest?.enabled && latest.apiKey) {
+    if (latest?.enabled && hasAnyApiProviderKey(latest)) {
       const validation = await validateApiConnection(context, latest, true);
       if (validation.valid) {
         notifyInfo(`API 配置已更新并验证通过：${preset.displayName}`);
@@ -1356,6 +1489,45 @@ export function activate(context: vscode.ExtensionContext): void {
   };
   registerSafeCommand(context, 'writingAgent.configureApi', configureApiHandler);
   registerSafeCommand(context, 'writingAgent.configureIFlowApi', configureApiHandler);
+  registerSafeCommand(context, 'writingAgent.reorderApiProviders', async () => {
+    const config = vscode.workspace.getConfiguration('writingAgent');
+    const settings = await resolveApiSettings(context);
+    const currentProvider = settings?.provider || 'iflow';
+    const configuredOrder = getConfiguredProviderOrder(config, currentProvider);
+    const reordered = await editProviderOrderByDrag('API 提供商顺序', configuredOrder);
+    if (!reordered || reordered.length === 0) {
+      return;
+    }
+    await updateProviderOrderConfig(reordered, getConfigurationTarget());
+    notifyInfo('API 提供商顺序已更新，调用将按从上到下依次尝试。');
+    quickEntryProvider.refresh();
+  });
+  registerSafeCommand(context, 'writingAgent.reorderApiModels', async () => {
+    const settings = await resolveApiSettings(context);
+    if (!settings?.enabled) {
+      notifyWarn('API 已关闭，请先开启后再调整模型顺序。');
+      return;
+    }
+    const models = normalizeModelCandidates(settings.models.length > 0 ? settings.models : [settings.model]);
+    if (models.length <= 1) {
+      notifyWarn('当前模型数量不足 2 个，无需调整顺序。');
+      return;
+    }
+
+    const title = `${getProviderPreset(settings.provider).displayName} 模型顺序`;
+    const reordered = await editModelOrderByDrag(title, models);
+    if (!reordered || reordered.length === 0) {
+      return;
+    }
+
+    const normalized = normalizeModelCandidates(reordered);
+    const config = vscode.workspace.getConfiguration('writingAgent');
+    const target = getConfigurationTarget();
+    await config.update('api.model', normalized[0], target);
+    await config.update('api.models', normalized, target);
+    notifyInfo('模型顺序已更新，后续调用将按从上到下顺序依次尝试。');
+    quickEntryProvider.refresh();
+  });
   registerSafeCommand(context, 'writingAgent.configureSuggestionMinChars', async () => {
     const config = vscode.workspace.getConfiguration('writingAgent');
     const target = getConfigurationTarget();
@@ -1391,7 +1563,7 @@ export function activate(context: vscode.ExtensionContext): void {
       notifyWarn('API 已关闭，请先开启后再测试。');
       return;
     }
-    if (!settings.apiKey) {
+    if (!hasAnyApiProviderKey(settings)) {
       const action = await vscode.window.showWarningMessage('未配置 API Key，请先配置后再测试。', '配置 API');
       if (action === '配置 API') {
         await vscode.commands.executeCommand('writingAgent.configureApi');
@@ -2494,17 +2666,143 @@ function getPrimaryWorkspaceRootUri(): vscode.Uri | null {
   return folders[0].uri;
 }
 
-function resolveStorageRootPath(): string {
-  const config = vscode.workspace.getConfiguration('writingAgent');
-  const configured = (config.get<string>('storage.path', '') || '').trim();
-  if (!configured) {
-    return path.join(os.homedir(), 'Downloads', STORAGE_DEFAULT_DIR_NAME);
+function normalizeStorageRootPath(rawPath: string): string {
+  const homeExpanded = rawPath.startsWith('~')
+    ? path.join(os.homedir(), rawPath.slice(1))
+    : rawPath;
+  return path.resolve(homeExpanded);
+}
+
+function canWriteDirectory(targetPath: string): boolean {
+  try {
+    fs.mkdirSync(targetPath, { recursive: true });
+    fs.accessSync(targetPath, fs.constants.W_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function canWriteExistingFile(filePath: string): boolean {
+  if (!fs.existsSync(filePath)) {
+    return true;
+  }
+  try {
+    const handle = fs.openSync(filePath, 'r+');
+    fs.closeSync(handle);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function canWriteStorageRoot(rootPath: string): boolean {
+  if (!canWriteDirectory(rootPath)) {
+    return false;
+  }
+  const dataDir = path.join(rootPath, STORAGE_DATA_RELATIVE_PREFIX);
+  if (!canWriteDirectory(dataDir)) {
+    return false;
   }
 
-  const homeExpanded = configured.startsWith('~')
-    ? path.join(os.homedir(), configured.slice(1))
-    : configured;
-  return path.resolve(homeExpanded);
+  // 用真实写入探测，规避“目录可访问但文件不可写”的 EPERM 场景（如 Downloads 权限受限）。
+  const probeFile = path.join(dataDir, `.write-probe-${Date.now()}-${Math.random().toString(36).slice(2)}.tmp`);
+  try {
+    fs.writeFileSync(probeFile, 'ok', 'utf8');
+    try {
+      fs.unlinkSync(probeFile);
+    } catch {
+      // 删除失败不影响可写判断
+    }
+  } catch {
+    return false;
+  }
+
+  if (!canWriteExistingFile(path.join(dataDir, 'styles.json'))) {
+    return false;
+  }
+  if (!canWriteExistingFile(path.join(dataDir, 'materials.by-style.json'))) {
+    return false;
+  }
+  if (!canWriteExistingFile(path.join(dataDir, 'articles.index.json'))) {
+    return false;
+  }
+  return true;
+}
+
+function loadCachedResolvedStorageRoot(preferredPath: string): string | null {
+  const cache = activeExtensionContext?.globalState.get<StorageRootResolutionCache | null>(
+    STORAGE_ROOT_RESOLUTION_CACHE_KEY,
+    null
+  );
+  if (!cache || cache.preferredPath !== preferredPath || !cache.resolvedPath) {
+    return null;
+  }
+  const resolvedPath = cache.resolvedPath;
+  if (!canWriteDirectory(resolvedPath)) {
+    return null;
+  }
+  const dataDir = path.join(resolvedPath, STORAGE_DATA_RELATIVE_PREFIX);
+  if (!canWriteDirectory(dataDir)) {
+    return null;
+  }
+  if (!canWriteExistingFile(path.join(dataDir, 'styles.json'))) {
+    return null;
+  }
+  if (!canWriteExistingFile(path.join(dataDir, 'materials.by-style.json'))) {
+    return null;
+  }
+  if (!canWriteExistingFile(path.join(dataDir, 'articles.index.json'))) {
+    return null;
+  }
+  return resolvedPath;
+}
+
+function persistResolvedStorageRoot(preferredPath: string, resolvedPath: string): void {
+  if (!activeExtensionContext) {
+    return;
+  }
+  const cache: StorageRootResolutionCache = { preferredPath, resolvedPath };
+  void activeExtensionContext.globalState.update(STORAGE_ROOT_RESOLUTION_CACHE_KEY, cache);
+}
+
+function computeStorageRootPath(): string {
+  const config = vscode.workspace.getConfiguration('writingAgent');
+  const configured = (config.get<string>('storage.path', '') || '').trim();
+  const preferred = configured
+    ? normalizeStorageRootPath(configured)
+    : path.join(os.homedir(), 'Downloads', STORAGE_DEFAULT_DIR_NAME);
+  const allowCache = !configured;
+  if (allowCache) {
+    const cached = loadCachedResolvedStorageRoot(preferred);
+    if (cached) {
+      return cached;
+    }
+  }
+  if (canWriteStorageRoot(preferred)) {
+    if (allowCache) {
+      persistResolvedStorageRoot(preferred, preferred);
+    }
+    return preferred;
+  }
+
+  const globalStoragePath = activeExtensionContext?.globalStorageUri.fsPath;
+  if (globalStoragePath && canWriteStorageRoot(globalStoragePath)) {
+    if (allowCache) {
+      persistResolvedStorageRoot(preferred, globalStoragePath);
+    }
+    console.warn(`[writing-agent] 存储目录不可写（${preferred}），已回退到扩展目录：${globalStoragePath}`);
+    return globalStoragePath;
+  }
+
+  return preferred;
+}
+
+function resolveStorageRootPath(): string {
+  if (!storageRootPathCache) {
+    storageRootPathCache = computeStorageRootPath();
+  }
+  return storageRootPathCache;
 }
 
 function resolveStorageRootUri(): vscode.Uri {
@@ -2629,11 +2927,495 @@ function getConfigurationTarget(): vscode.ConfigurationTarget {
 }
 
 function isApiProvider(value: string): value is ApiProvider {
-  return ['iflow', 'kimi', 'deepseek', 'minimax', 'qwen', 'custom'].includes(value);
+  return ['iflow', 'openrouter', 'kimi', 'deepseek', 'minimax', 'qwen', 'custom'].includes(value);
 }
 
 function getProviderPreset(provider: ApiProvider): ProviderPreset {
   return PROVIDER_PRESETS[provider];
+}
+
+function getAllApiProviders(): ApiProvider[] {
+  return Object.keys(PROVIDER_PRESETS) as ApiProvider[];
+}
+
+function normalizeProviderOrder(
+  rawOrder: unknown,
+  fallbackProvider?: ApiProvider
+): ApiProvider[] {
+  const ordered: ApiProvider[] = [];
+  const pushIfValid = (value: unknown): void => {
+    if (typeof value !== 'string' || !isApiProvider(value)) {
+      return;
+    }
+    if (!ordered.includes(value)) {
+      ordered.push(value);
+    }
+  };
+  if (Array.isArray(rawOrder)) {
+    rawOrder.forEach(pushIfValid);
+  }
+  if (fallbackProvider) {
+    pushIfValid(fallbackProvider);
+  }
+  getAllApiProviders().forEach(pushIfValid);
+  return ordered;
+}
+
+function normalizeModelCandidates(candidates: string[]): string[] {
+  const normalized: string[] = [];
+  for (const model of candidates) {
+    const trimmed = model.trim();
+    if (!trimmed || normalized.includes(trimmed)) {
+      continue;
+    }
+    normalized.push(trimmed);
+  }
+  return normalized;
+}
+
+function parseModelCandidatesInput(rawInput: string, fallbackModels: string[]): string[] {
+  const rawCandidates = rawInput
+    .split(/[\n,，]/g)
+    .map(item => item.trim())
+    .filter(Boolean);
+  const parsed = normalizeModelCandidates(rawCandidates);
+  if (parsed.length > 0) {
+    return parsed;
+  }
+  const fallback = normalizeModelCandidates(fallbackModels);
+  return fallback;
+}
+
+function formatModelChainLabel(models: string[]): string {
+  const normalized = normalizeModelCandidates(models);
+  if (normalized.length === 0) {
+    return '未配置模型';
+  }
+  if (normalized.length <= 2) {
+    return normalized.join('→');
+  }
+  return `${normalized.slice(0, 2).join('→')}→+${normalized.length - 2}`;
+}
+
+async function promptManualModelCandidates(
+  displayName: string,
+  defaultModels: string[]
+): Promise<string[] | undefined> {
+  const defaultValue = normalizeModelCandidates(defaultModels).join(', ');
+  const modelInput = await vscode.window.showInputBox({
+    prompt: `模型列表（${displayName}，按优先级；支持逗号或换行分隔）`,
+    value: defaultValue
+  });
+  if (modelInput === undefined) {
+    return undefined;
+  }
+  const fallbackModels = normalizeModelCandidates(defaultModels);
+  const parsed = parseModelCandidatesInput(modelInput, fallbackModels);
+  return parsed.length > 0 ? parsed : fallbackModels;
+}
+
+function getModelOrderEditorWebview(models: string[]): string {
+  const initialModels = JSON.stringify(models);
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <style>
+    body {
+      font-family: var(--vscode-font-family);
+      color: var(--vscode-foreground);
+      background: var(--vscode-editor-background);
+      margin: 0;
+      padding: 16px;
+    }
+    .hint {
+      color: var(--vscode-descriptionForeground);
+      margin-bottom: 12px;
+      font-size: 12px;
+    }
+    ul {
+      list-style: none;
+      padding: 0;
+      margin: 0;
+      border: 1px solid var(--vscode-panel-border);
+      border-radius: 6px;
+      overflow: hidden;
+    }
+    li {
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--vscode-panel-border);
+      background: var(--vscode-editorWidget-background);
+      cursor: grab;
+      user-select: none;
+    }
+    li:last-child {
+      border-bottom: none;
+    }
+    li.dragging {
+      opacity: 0.55;
+    }
+    li.over {
+      outline: 2px solid var(--vscode-focusBorder);
+      outline-offset: -2px;
+    }
+    .actions {
+      margin-top: 14px;
+      display: flex;
+      gap: 8px;
+    }
+    button {
+      border: 0;
+      border-radius: 4px;
+      padding: 7px 12px;
+      cursor: pointer;
+      font-size: 12px;
+    }
+    #save {
+      background: var(--vscode-button-background);
+      color: var(--vscode-button-foreground);
+    }
+    #cancel {
+      background: var(--vscode-button-secondaryBackground);
+      color: var(--vscode-button-secondaryForeground);
+    }
+  </style>
+</head>
+<body>
+  <div class="hint">拖拽排序后，调用会按从上到下顺序依次尝试。</div>
+  <ul id="models"></ul>
+  <div class="actions">
+    <button id="save">保存顺序</button>
+    <button id="cancel">取消</button>
+  </div>
+  <script>
+    const vscode = acquireVsCodeApi();
+    let models = ${initialModels};
+    let dragIndex = -1;
+
+    const list = document.getElementById('models');
+    const saveBtn = document.getElementById('save');
+    const cancelBtn = document.getElementById('cancel');
+
+    function render() {
+      list.innerHTML = '';
+      models.forEach((model, index) => {
+        const li = document.createElement('li');
+        li.draggable = true;
+        li.dataset.index = String(index);
+        li.textContent = model;
+        li.addEventListener('dragstart', event => {
+          dragIndex = Number(li.dataset.index);
+          li.classList.add('dragging');
+          if (event.dataTransfer) {
+            event.dataTransfer.effectAllowed = 'move';
+            event.dataTransfer.setData('text/plain', li.dataset.index || '0');
+          }
+        });
+        li.addEventListener('dragend', () => {
+          dragIndex = -1;
+          li.classList.remove('dragging');
+          document.querySelectorAll('li.over').forEach(item => item.classList.remove('over'));
+        });
+        li.addEventListener('dragover', event => {
+          event.preventDefault();
+          li.classList.add('over');
+        });
+        li.addEventListener('dragleave', () => {
+          li.classList.remove('over');
+        });
+        li.addEventListener('drop', event => {
+          event.preventDefault();
+          li.classList.remove('over');
+          const dropIndex = Number(li.dataset.index);
+          if (!Number.isInteger(dragIndex) || dragIndex < 0 || dragIndex === dropIndex) {
+            return;
+          }
+          const next = [...models];
+          const moved = next.splice(dragIndex, 1)[0];
+          next.splice(dropIndex, 0, moved);
+          models = next;
+          render();
+        });
+        list.appendChild(li);
+      });
+    }
+
+    saveBtn.addEventListener('click', () => {
+      vscode.postMessage({ type: 'save', models });
+    });
+    cancelBtn.addEventListener('click', () => {
+      vscode.postMessage({ type: 'cancel' });
+    });
+
+    render();
+  </script>
+</body>
+</html>`;
+}
+
+async function editModelOrderByDrag(
+  title: string,
+  models: string[]
+): Promise<string[] | undefined> {
+  const normalized = normalizeModelCandidates(models);
+  if (normalized.length <= 1) {
+    return normalized;
+  }
+
+  const panel = vscode.window.createWebviewPanel(
+    'writingAgent.modelOrderEditor',
+    title,
+    vscode.ViewColumn.Active,
+    { enableScripts: true }
+  );
+  panel.webview.html = getModelOrderEditorWebview(normalized);
+
+  return new Promise<string[] | undefined>(resolve => {
+    let settled = false;
+    const finish = (value: string[] | undefined): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      resolve(value);
+    };
+
+    const receiveDisposable = panel.webview.onDidReceiveMessage(message => {
+      const payload = message as { type?: string; models?: unknown };
+      if (payload.type === 'save') {
+        const next = Array.isArray(payload.models)
+          ? payload.models.filter((item): item is string => typeof item === 'string')
+          : [];
+        const parsed = normalizeModelCandidates(next);
+        finish(parsed.length > 0 ? parsed : normalized);
+        panel.dispose();
+        return;
+      }
+      if (payload.type === 'cancel') {
+        finish(undefined);
+        panel.dispose();
+      }
+    });
+    const disposeDisposable = panel.onDidDispose(() => {
+      receiveDisposable.dispose();
+      finish(undefined);
+    });
+    void receiveDisposable;
+    void disposeDisposable;
+  });
+}
+
+function getProviderOrderEditorWebview(providers: ApiProvider[]): string {
+  const initialProviders = JSON.stringify(providers);
+  const providerMeta = JSON.stringify(
+    getAllApiProviders().reduce<Record<string, { label: string; detail: string }>>((acc, provider) => {
+      const preset = getProviderPreset(provider);
+      acc[provider] = {
+        label: preset.displayName,
+        detail: `${provider} · ${preset.defaultBaseUrl}`
+      };
+      return acc;
+    }, {})
+  );
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <style>
+    body { font-family: var(--vscode-font-family); color: var(--vscode-foreground); padding: 16px; }
+    .hint { color: var(--vscode-descriptionForeground); margin-bottom: 12px; font-size: 12px; }
+    ul { list-style: none; padding: 0; margin: 0; border: 1px solid var(--vscode-panel-border); border-radius: 6px; overflow: hidden; }
+    li { padding: 10px 12px; border-bottom: 1px solid var(--vscode-panel-border); background: var(--vscode-editorWidget-background); cursor: grab; user-select: none; }
+    li:last-child { border-bottom: none; }
+    li.dragging { opacity: 0.55; }
+    li.over { outline: 2px solid var(--vscode-focusBorder); outline-offset: -2px; }
+    .provider-name { font-weight: 600; }
+    .provider-detail { color: var(--vscode-descriptionForeground); font-size: 12px; margin-top: 2px; }
+    .actions { margin-top: 14px; display: flex; gap: 8px; }
+    button { border: 0; border-radius: 4px; padding: 7px 12px; cursor: pointer; font-size: 12px; }
+    #save { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
+    #cancel { background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); }
+  </style>
+</head>
+<body>
+  <div class="hint">拖拽排序后，调用会按从上到下顺序依次尝试各 API 提供商。</div>
+  <ul id="providers"></ul>
+  <div class="actions">
+    <button id="save">保存顺序</button>
+    <button id="cancel">取消</button>
+  </div>
+  <script>
+    const vscode = acquireVsCodeApi();
+    const providerMeta = ${providerMeta};
+    let providers = ${initialProviders};
+    let dragIndex = -1;
+    const list = document.getElementById('providers');
+    const saveBtn = document.getElementById('save');
+    const cancelBtn = document.getElementById('cancel');
+
+    function render() {
+      list.innerHTML = '';
+      providers.forEach((provider, index) => {
+        const li = document.createElement('li');
+        li.draggable = true;
+        li.dataset.index = String(index);
+
+        const name = document.createElement('div');
+        name.className = 'provider-name';
+        name.textContent = providerMeta[provider]?.label || provider;
+
+        const detail = document.createElement('div');
+        detail.className = 'provider-detail';
+        detail.textContent = providerMeta[provider]?.detail || provider;
+
+        li.appendChild(name);
+        li.appendChild(detail);
+        li.addEventListener('dragstart', event => {
+          dragIndex = Number(li.dataset.index);
+          li.classList.add('dragging');
+          if (event.dataTransfer) {
+            event.dataTransfer.effectAllowed = 'move';
+            event.dataTransfer.setData('text/plain', li.dataset.index || '0');
+          }
+        });
+        li.addEventListener('dragend', () => {
+          dragIndex = -1;
+          li.classList.remove('dragging');
+          document.querySelectorAll('li.over').forEach(item => item.classList.remove('over'));
+        });
+        li.addEventListener('dragover', event => {
+          event.preventDefault();
+          li.classList.add('over');
+        });
+        li.addEventListener('dragleave', () => {
+          li.classList.remove('over');
+        });
+        li.addEventListener('drop', event => {
+          event.preventDefault();
+          li.classList.remove('over');
+          const dropIndex = Number(li.dataset.index);
+          if (!Number.isInteger(dragIndex) || dragIndex < 0 || dragIndex === dropIndex) {
+            return;
+          }
+          const next = [...providers];
+          const moved = next.splice(dragIndex, 1)[0];
+          next.splice(dropIndex, 0, moved);
+          providers = next;
+          render();
+        });
+        list.appendChild(li);
+      });
+    }
+
+    saveBtn.addEventListener('click', () => vscode.postMessage({ type: 'save', providers }));
+    cancelBtn.addEventListener('click', () => vscode.postMessage({ type: 'cancel' }));
+    render();
+  </script>
+</body>
+</html>`;
+}
+
+async function editProviderOrderByDrag(
+  title: string,
+  providers: ApiProvider[]
+): Promise<ApiProvider[] | undefined> {
+  const normalized = normalizeProviderOrder(providers);
+  if (normalized.length <= 1) {
+    return normalized;
+  }
+  const panel = vscode.window.createWebviewPanel(
+    'writingAgent.providerOrderEditor',
+    title,
+    vscode.ViewColumn.Active,
+    { enableScripts: true }
+  );
+  panel.webview.html = getProviderOrderEditorWebview(normalized);
+
+  return new Promise<ApiProvider[] | undefined>(resolve => {
+    let settled = false;
+    const finish = (value: ApiProvider[] | undefined): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      resolve(value);
+    };
+
+    const receiveDisposable = panel.webview.onDidReceiveMessage(message => {
+      const payload = message as { type?: string; providers?: unknown };
+      if (payload.type === 'save') {
+        const next = normalizeProviderOrder(payload.providers);
+        finish(next.length > 0 ? next : normalized);
+        panel.dispose();
+        return;
+      }
+      if (payload.type === 'cancel') {
+        finish(undefined);
+        panel.dispose();
+      }
+    });
+    const disposeDisposable = panel.onDidDispose(() => {
+      receiveDisposable.dispose();
+      finish(undefined);
+    });
+    void receiveDisposable;
+    void disposeDisposable;
+  });
+}
+
+async function pickProviderModelCandidates(
+  providerDisplayName: string,
+  apiKey: string,
+  baseUrl: string,
+  defaultModels: string[],
+  timeoutMs: number
+): Promise<string[] | undefined> {
+  let fetchedModels: string[] = [];
+  if (apiKey.trim()) {
+    try {
+      await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: `正在加载 ${providerDisplayName} 模型列表...`,
+          cancellable: false
+        },
+        async () => {
+          fetchedModels = await listOpenAiCompatibleModels({
+            apiKey: apiKey.trim(),
+            baseUrl,
+            timeoutMs
+          });
+        }
+      );
+    } catch (error) {
+      const message = error instanceof Error ? summarizeError(error.message, 60) : '请求失败';
+      notifyWarn(`获取 ${providerDisplayName} 模型列表失败，将回退本地候选：${message}`);
+    }
+  }
+
+  const candidates = normalizeModelCandidates([...fetchedModels, ...defaultModels]);
+  if (candidates.length === 0) {
+    return undefined;
+  }
+
+  const picked = await vscode.window.showQuickPick(
+    candidates.map(model => ({
+      label: model,
+      description: defaultModels.includes(model) ? '当前/默认' : ''
+    })),
+    {
+      canPickMany: true,
+      placeHolder: `选择一个或多个 ${providerDisplayName} 模型（按列表顺序作为优先级）`,
+      ignoreFocusOut: true
+    }
+  );
+  if (!picked) {
+    return undefined;
+  }
+  const selectedModels = normalizeModelCandidates(picked.map(item => item.label));
+  return selectedModels.length > 0 ? selectedModels : undefined;
 }
 
 function getProviderSecretKey(provider: ApiProvider): string {
@@ -2644,6 +3426,8 @@ function getProviderEnvKey(provider: ApiProvider): string {
   switch (provider) {
     case 'iflow':
       return 'IFLOW_API_KEY';
+    case 'openrouter':
+      return 'OPENROUTER_API_KEY';
     case 'kimi':
       return 'KIMI_API_KEY';
     case 'deepseek':
@@ -2659,12 +3443,45 @@ function getProviderEnvKey(provider: ApiProvider): string {
   }
 }
 
+async function resolveProviderApiKey(
+  context: vscode.ExtensionContext,
+  provider: ApiProvider
+): Promise<string> {
+  const config = vscode.workspace.getConfiguration('writingAgent');
+  const providerSecret = ((await context.secrets.get(getProviderSecretKey(provider))) || '').trim();
+  const legacyIflowSecret = provider === 'iflow'
+    ? ((await context.secrets.get(LEGACY_IFLOW_SECRET_KEY)) || '').trim()
+    : '';
+  const legacyConfigKey = provider === 'iflow'
+    ? (config.get<string>('iflow.apiKey', '') || '').trim()
+    : '';
+  const envProviderKey = (process.env[getProviderEnvKey(provider)] || '').trim();
+  const envGenericKey = (process.env.WRITING_AGENT_API_KEY || '').trim();
+  return providerSecret || legacyIflowSecret || legacyConfigKey || envProviderKey || envGenericKey;
+}
+
+function getConfiguredProviderOrder(config: vscode.WorkspaceConfiguration, currentProvider: ApiProvider): ApiProvider[] {
+  const raw = config.get<unknown>('api.providerOrder', []);
+  return normalizeProviderOrder(raw, currentProvider);
+}
+
+async function updateProviderOrderConfig(
+  providerOrder: ApiProvider[],
+  target: vscode.ConfigurationTarget
+): Promise<void> {
+  const config = vscode.workspace.getConfiguration('writingAgent');
+  const normalized = normalizeProviderOrder(providerOrder);
+  await config.update('api.providerOrder', normalized, target);
+}
+
 async function pickApiProvider(currentProvider: ApiProvider): Promise<ApiProvider | undefined> {
-  const options = (Object.keys(PROVIDER_PRESETS) as ApiProvider[]).map(provider => {
+  const config = vscode.workspace.getConfiguration('writingAgent');
+  const providerOrder = getConfiguredProviderOrder(config, currentProvider);
+  const options = providerOrder.map((provider, index) => {
     const preset = getProviderPreset(provider);
     return {
       label: preset.displayName,
-      description: provider === currentProvider ? '当前' : '',
+      description: provider === currentProvider ? '当前' : `顺序 ${index + 1}`,
       detail: `${provider} · ${preset.defaultBaseUrl}`,
       provider
     };
@@ -2682,42 +3499,91 @@ async function resolveApiSettings(
   const enabled = config.get<boolean>('api.enabled', config.get<boolean>('iflow.enabled', true));
   const rawProvider = config.get<string>('api.provider', 'iflow');
   const provider: ApiProvider = isApiProvider(rawProvider) ? rawProvider : 'iflow';
-  const preset = getProviderPreset(provider);
+  const providerOrder = getConfiguredProviderOrder(config, provider);
 
-  const baseUrl = config.get<string>(
-    'api.baseUrl',
-    provider === 'iflow'
-      ? config.get<string>('iflow.baseUrl', preset.defaultBaseUrl)
-      : preset.defaultBaseUrl
-  );
-  const model = config.get<string>(
-    'api.model',
-    provider === 'iflow'
-      ? config.get<string>('iflow.model', preset.defaultModel)
-      : preset.defaultModel
-  );
+  const rawProviderConfigs = config.get<unknown>('api.providerConfigs', {});
+  const providerConfigs = rawProviderConfigs && typeof rawProviderConfigs === 'object'
+    ? rawProviderConfigs as Record<string, unknown>
+    : {};
+
+  const resolvedByProvider = new Map<ApiProvider, RuntimeProviderCandidate>();
+  for (const item of providerOrder) {
+    const preset = getProviderPreset(item);
+    const rawConfig = providerConfigs[item];
+    const providerConfig = rawConfig && typeof rawConfig === 'object'
+      ? rawConfig as Record<string, unknown>
+      : {};
+
+    const configuredBaseUrl = typeof providerConfig.baseUrl === 'string'
+      ? providerConfig.baseUrl
+      : '';
+    const baseUrl = item === provider
+      ? config.get<string>(
+        'api.baseUrl',
+        item === 'iflow'
+          ? config.get<string>('iflow.baseUrl', configuredBaseUrl || preset.defaultBaseUrl)
+          : configuredBaseUrl || preset.defaultBaseUrl
+      )
+      : (configuredBaseUrl || preset.defaultBaseUrl);
+
+    const configuredModel = typeof providerConfig.model === 'string' ? providerConfig.model : '';
+    const model = item === provider
+      ? config.get<string>(
+        'api.model',
+        item === 'iflow'
+          ? config.get<string>('iflow.model', configuredModel || preset.defaultModel)
+          : configuredModel || preset.defaultModel
+      )
+      : (configuredModel || preset.defaultModel);
+
+    const configuredModelsRaw = providerConfig.models;
+    const configuredModels = Array.isArray(configuredModelsRaw)
+      ? configuredModelsRaw.filter((value): value is string => typeof value === 'string')
+      : [];
+    const activeModels = item === provider
+      ? (Array.isArray(config.get<unknown>('api.models', []))
+        ? (config.get<unknown>('api.models', []) as unknown[]).filter((value): value is string => typeof value === 'string')
+        : [])
+      : configuredModels;
+    const parsedModels = normalizeModelCandidates([model, ...activeModels]);
+    const models = parsedModels.length > 0 ? parsedModels : [preset.defaultModel];
+    const primaryModel = models[0];
+
+    const apiKey = await resolveProviderApiKey(context, item);
+    resolvedByProvider.set(item, {
+      provider: item,
+      apiKey,
+      baseUrl,
+      model: primaryModel,
+      models
+    });
+  }
+
+  const activeCandidate = resolvedByProvider.get(provider) || {
+    provider,
+    apiKey: await resolveProviderApiKey(context, provider),
+    baseUrl: getProviderPreset(provider).defaultBaseUrl,
+    model: getProviderPreset(provider).defaultModel,
+    models: [getProviderPreset(provider).defaultModel]
+  };
+  const providerCandidates = providerOrder
+    .map(item => resolvedByProvider.get(item))
+    .filter((item): item is RuntimeProviderCandidate => Boolean(item));
+
   const temperature = config.get<number>('api.temperature', config.get<number>('iflow.temperature', 0.7));
   const maxTokens = config.get<number>('api.maxTokens', config.get<number>('iflow.maxTokens', 10000));
   const timeoutMs = config.get<number>('api.timeoutMs', config.get<number>('iflow.timeoutMs', 60000));
-
-  const providerSecret = ((await context.secrets.get(getProviderSecretKey(provider))) || '').trim();
-  const legacyIflowSecret = provider === 'iflow'
-    ? ((await context.secrets.get(LEGACY_IFLOW_SECRET_KEY)) || '').trim()
-    : '';
-  const legacyConfigKey = provider === 'iflow'
-    ? (config.get<string>('iflow.apiKey', '') || '').trim()
-    : '';
-  const envProviderKey = (process.env[getProviderEnvKey(provider)] || '').trim();
-  const envGenericKey = (process.env.WRITING_AGENT_API_KEY || '').trim();
-  const apiKey = providerSecret || legacyIflowSecret || legacyConfigKey || envProviderKey || envGenericKey;
 
   if (!enabled) {
     return {
       enabled: false,
       provider,
+      providerOrder,
+      providerCandidates,
       apiKey: '',
-      baseUrl,
-      model,
+      baseUrl: activeCandidate.baseUrl,
+      model: activeCandidate.model,
+      models: activeCandidate.models,
       temperature,
       maxTokens,
       timeoutMs
@@ -2727,9 +3593,12 @@ async function resolveApiSettings(
   return {
     enabled,
     provider,
-    apiKey,
-    baseUrl,
-    model,
+    providerOrder,
+    providerCandidates,
+    apiKey: activeCandidate.apiKey,
+    baseUrl: activeCandidate.baseUrl,
+    model: activeCandidate.model,
+    models: activeCandidate.models,
     temperature,
     maxTokens,
     timeoutMs
@@ -2738,9 +3607,8 @@ async function resolveApiSettings(
 
 function buildApiValidationFingerprint(settings: RuntimeApiSettings): string {
   return [
-    settings.provider,
-    settings.baseUrl.trim(),
-    settings.model.trim()
+    settings.providerOrder.join('>'),
+    ...settings.providerCandidates.map(candidate => `${candidate.provider}|${candidate.baseUrl.trim()}|${candidate.models.join(',')}|${candidate.apiKey ? '1' : '0'}`)
   ].join('|');
 }
 
@@ -2767,6 +3635,94 @@ function summarizeError(message: string, maxLength: number): string {
   return `${singleLine.slice(0, Math.max(0, maxLength - 1))}…`;
 }
 
+function buildApiFailureHint(message: string): string | null {
+  const normalized = message.toLowerCase();
+  if (
+    normalized.includes('401')
+    || normalized.includes('unauthorized')
+    || normalized.includes('invalid api key')
+    || normalized.includes('no auth')
+    || normalized.includes('api key')
+    || normalized.includes('认证')
+    || normalized.includes('密钥')
+  ) {
+    return '请检查 API Key 是否正确，且与当前提供商匹配。';
+  }
+  if (
+    normalized.includes('429')
+    || normalized.includes('quota')
+    || normalized.includes('insufficient')
+    || normalized.includes('rate limit')
+    || normalized.includes('额度')
+    || normalized.includes('余额')
+    || normalized.includes('限流')
+  ) {
+    return '可能触发额度/限流，请稍后重试或更换备用模型。';
+  }
+  if (normalized.includes('timeout') || normalized.includes('超时')) {
+    return '请求可能超时，可提高 `writingAgent.api.timeoutMs` 或更换响应更快的模型。';
+  }
+  return null;
+}
+
+function hasAnyApiProviderKey(settings: RuntimeApiSettings): boolean {
+  if (settings.apiKey.trim()) {
+    return true;
+  }
+  return settings.providerCandidates.some(candidate => candidate.apiKey.trim().length > 0);
+}
+
+function buildApiFallbackNotice(result: ApiGenerationResult): string | null {
+  if (!result.fallbackUsed || !result.fallbackFromModel) {
+    return null;
+  }
+  const fromProviderLabel = result.fallbackFromProvider
+    ? getProviderPreset(result.fallbackFromProvider).displayName
+    : '';
+  const toProviderLabel = getProviderPreset(result.provider).displayName;
+  if (result.fallbackFromProvider && result.fallbackFromProvider !== result.provider) {
+    return `主调用“${fromProviderLabel}/${result.fallbackFromModel}”不可用，已自动切换到“${toProviderLabel}/${result.model}”。`;
+  }
+  return `主模型“${result.fallbackFromModel}”不可用，已自动切换到“${result.model}”。`;
+}
+
+function shouldTryModelDiscoveryForValidation(settings: RuntimeApiSettings, failureMessage: string): boolean {
+  if (!settings.apiKey.trim()) {
+    return false;
+  }
+  if (settings.provider !== 'iflow' && settings.provider !== 'openrouter') {
+    return false;
+  }
+  const normalized = failureMessage.toLowerCase();
+  return (
+    normalized.includes('所有模型均不可用')
+    || normalized.includes('model')
+    || normalized.includes('不支持')
+    || normalized.includes('not found')
+    || normalized.includes('invalid model')
+    || normalized.includes('does not exist')
+  );
+}
+
+function pickDiscoveryCandidatesForValidation(
+  provider: ApiProvider,
+  discoveredModels: string[],
+  existingModels: string[]
+): string[] {
+  const normalizedDiscovered = normalizeModelCandidates(discoveredModels);
+  const normalizedExisting = normalizeModelCandidates(existingModels);
+  if (normalizedDiscovered.length === 0) {
+    return [];
+  }
+  if (provider === 'openrouter') {
+    const freeModels = normalizedDiscovered.filter(model => model.toLowerCase().includes(':free'));
+    const regularModels = normalizedDiscovered.filter(model => !model.toLowerCase().includes(':free'));
+    const ranked = normalizeModelCandidates([...freeModels, ...regularModels]).slice(0, 6);
+    return normalizeModelCandidates([...ranked, ...normalizedExisting]);
+  }
+  return normalizeModelCandidates([...normalizedDiscovered.slice(0, 6), ...normalizedExisting]);
+}
+
 async function validateApiConnection(
   context: vscode.ExtensionContext,
   settings: RuntimeApiSettings,
@@ -2774,16 +3730,19 @@ async function validateApiConnection(
 ): Promise<{ valid: boolean; message: string }> {
   const prompt = '请仅回复 OK';
   try {
-    const result = await generateWithOpenAiCompatibleApi({
-      apiKey: settings.apiKey,
-      baseUrl: settings.baseUrl,
-      model: settings.model,
-      prompt,
+    const result = await generateWithFallbackModel(settings, prompt, {
       temperature: 0,
       maxTokens: 16,
-      timeoutMs: Math.min(Math.max(settings.timeoutMs, 8000), 10000)
+      timeoutMs: Math.min(
+        Math.max(settings.timeoutMs, API_VALIDATION_TIMEOUT_MIN_MS),
+        API_VALIDATION_TIMEOUT_MAX_MS
+      )
     });
-    const message = `连接成功（${result.model || settings.model}）`;
+    const providerLabel = getProviderPreset(result.provider).displayName;
+    const fallbackNotice = buildApiFallbackNotice(result);
+    const message = fallbackNotice
+      ? `连接成功（${providerLabel}/${result.model}；${fallbackNotice}）`
+      : `连接成功（${providerLabel}/${result.model}）`;
     if (persist) {
       await saveApiValidationState(context, {
         fingerprint: buildApiValidationFingerprint(settings),
@@ -2795,6 +3754,86 @@ async function validateApiConnection(
     return { valid: true, message };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    if (shouldTryModelDiscoveryForValidation(settings, message)) {
+      try {
+        const discovered = await listOpenAiCompatibleModels({
+          apiKey: settings.apiKey,
+          baseUrl: settings.baseUrl,
+          timeoutMs: Math.min(
+            Math.max(settings.timeoutMs, API_VALIDATION_TIMEOUT_MIN_MS),
+            API_VALIDATION_TIMEOUT_MAX_MS
+          )
+        });
+        const discoveredModels = pickDiscoveryCandidatesForValidation(
+          settings.provider,
+          discovered,
+          settings.models
+        );
+        if (discoveredModels.length > 0) {
+          const activeCandidate: RuntimeProviderCandidate = {
+            provider: settings.provider,
+            apiKey: settings.apiKey,
+            baseUrl: settings.baseUrl,
+            model: discoveredModels[0],
+            models: discoveredModels
+          };
+          const retryResult = await generateWithFallbackModel(
+            {
+              ...settings,
+              providerOrder: [settings.provider],
+              providerCandidates: [activeCandidate],
+              model: activeCandidate.model,
+              models: activeCandidate.models
+            },
+            prompt,
+            {
+              temperature: 0,
+              maxTokens: 16,
+              timeoutMs: Math.min(
+                Math.max(settings.timeoutMs, API_VALIDATION_TIMEOUT_MIN_MS),
+                API_VALIDATION_TIMEOUT_MAX_MS
+              )
+            }
+          );
+          const validatedModels = normalizeModelCandidates([retryResult.model, ...discoveredModels]);
+          const config = vscode.workspace.getConfiguration('writingAgent');
+          const target = getConfigurationTarget();
+          await config.update('api.model', validatedModels[0], getConfigurationTarget());
+          await config.update('api.models', validatedModels, getConfigurationTarget());
+          const rawProviderConfigs = config.get<unknown>('api.providerConfigs', {});
+          const providerConfigs = rawProviderConfigs && typeof rawProviderConfigs === 'object'
+            ? { ...(rawProviderConfigs as Record<string, unknown>) }
+            : {};
+          providerConfigs[settings.provider] = {
+            baseUrl: settings.baseUrl,
+            model: validatedModels[0],
+            models: validatedModels
+          };
+          await config.update('api.providerConfigs', providerConfigs, target);
+
+          const providerLabel = getProviderPreset(settings.provider).displayName;
+          const autoMessage = `连接成功（${providerLabel}/${retryResult.model}，已自动刷新模型列表）`;
+          if (persist) {
+            await saveApiValidationState(context, {
+              fingerprint: buildApiValidationFingerprint({
+                ...settings,
+                providerCandidates: settings.providerCandidates.map(candidate => candidate.provider === settings.provider
+                  ? { ...candidate, model: validatedModels[0], models: validatedModels }
+                  : candidate),
+                model: validatedModels[0],
+                models: validatedModels
+              }),
+              valid: true,
+              message: autoMessage,
+              checkedAt: new Date().toISOString()
+            });
+          }
+          return { valid: true, message: autoMessage };
+        }
+      } catch {
+        // 自动发现失败时返回原始错误
+      }
+    }
     if (persist) {
       await saveApiValidationState(context, {
         fingerprint: buildApiValidationFingerprint(settings),
@@ -2958,53 +3997,92 @@ async function ensureUniqueTargetUri(uri: vscode.Uri): Promise<vscode.Uri> {
   }
 }
 
-async function generateWithFallbackModel(settings: RuntimeApiSettings, prompt: string): Promise<ApiGenerationResult> {
-  const firstResult = await generateWithOpenAiCompatibleApi({
-    apiKey: settings.apiKey,
-    baseUrl: settings.baseUrl,
-    model: settings.model,
-    prompt,
-    temperature: settings.temperature,
-    maxTokens: settings.maxTokens,
-    timeoutMs: settings.timeoutMs
-  }).catch(error => ({ error } as const));
+async function generateWithFallbackModel(
+  settings: RuntimeApiSettings,
+  prompt: string,
+  overrides?: {
+    temperature?: number;
+    maxTokens?: number;
+    timeoutMs?: number;
+  }
+): Promise<ApiGenerationResult> {
+  const providerCandidates = settings.providerCandidates.length > 0
+    ? settings.providerCandidates
+    : [
+      {
+        provider: settings.provider,
+        apiKey: settings.apiKey,
+        baseUrl: settings.baseUrl,
+        model: settings.model,
+        models: settings.models
+      }
+    ];
 
-  if (!('error' in firstResult)) {
-    return {
-      content: firstResult.content,
-      model: firstResult.model || settings.model,
-      fallbackUsed: false
-    };
+  const firstProvider = providerCandidates[0];
+  const firstProviderModels = normalizeModelCandidates(firstProvider.models.length > 0 ? firstProvider.models : [firstProvider.model]);
+  const firstModel = firstProviderModels[0];
+
+  const failedReasons: string[] = [];
+  let hasUsableKey = false;
+  for (let providerIndex = 0; providerIndex < providerCandidates.length; providerIndex += 1) {
+    const candidateProvider = providerCandidates[providerIndex];
+    const providerName = getProviderPreset(candidateProvider.provider).displayName;
+    if (!candidateProvider.apiKey.trim()) {
+      failedReasons.push(`【${providerName}】未配置 API Key`);
+      continue;
+    }
+    hasUsableKey = true;
+
+    const models = normalizeModelCandidates(
+      candidateProvider.models.length > 0 ? candidateProvider.models : [candidateProvider.model]
+    );
+    if (models.length === 0) {
+      failedReasons.push(`【${providerName}】未配置可用模型`);
+      continue;
+    }
+
+    for (let modelIndex = 0; modelIndex < models.length; modelIndex += 1) {
+      const candidateModel = models[modelIndex];
+      try {
+        const result = await generateWithOpenAiCompatibleApi({
+          apiKey: candidateProvider.apiKey,
+          baseUrl: candidateProvider.baseUrl,
+          model: candidateModel,
+          prompt,
+          temperature: overrides?.temperature ?? settings.temperature,
+          maxTokens: overrides?.maxTokens ?? settings.maxTokens,
+          timeoutMs: overrides?.timeoutMs ?? settings.timeoutMs
+        });
+        const resolvedModel = result.model || candidateModel;
+        const providerChanged = providerIndex > 0;
+        const modelChanged = modelIndex > 0;
+        return {
+          content: result.content,
+          provider: candidateProvider.provider,
+          model: resolvedModel,
+          fallbackUsed: providerChanged || modelChanged,
+          fallbackFromProvider: providerChanged ? firstProvider.provider : undefined,
+          fallbackFromModel: providerChanged
+            ? firstModel
+            : (modelChanged ? models[0] : undefined)
+        };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        failedReasons.push(`【${providerName}/${candidateModel}】${summarizeError(message, 80)}`);
+      }
+    }
   }
 
-  if (!isModelNotSupportedApiError(firstResult.error)) {
-    throw firstResult.error;
+  if (!hasUsableKey) {
+    throw new Error('未配置可用 API Key。请先配置至少一个提供商的 API Key。');
   }
 
-  const presetModel = getProviderPreset(settings.provider).defaultModel.trim();
-  const currentModel = settings.model.trim();
-  if (!presetModel || presetModel === currentModel) {
-    throw new Error(`当前模型不受支持：${currentModel}。请执行“写作助手: 配置 API”更换模型后重试。`);
+  const detail = failedReasons.join('；');
+  const hint = buildApiFailureHint(detail);
+  if (hint) {
+    throw new Error(`所有模型均不可用：${detail}。${hint}`);
   }
-
-  const retryResult = await generateWithOpenAiCompatibleApi({
-    apiKey: settings.apiKey,
-    baseUrl: settings.baseUrl,
-    model: presetModel,
-    prompt,
-    temperature: settings.temperature,
-    maxTokens: settings.maxTokens,
-    timeoutMs: settings.timeoutMs
-  });
-
-  const config = vscode.workspace.getConfiguration('writingAgent');
-  await config.update('api.model', presetModel, getConfigurationTarget());
-  return {
-    content: retryResult.content,
-    model: retryResult.model || presetModel,
-    fallbackUsed: true,
-    fallbackFromModel: currentModel
-  };
+  throw new Error(`所有模型均不可用：${detail}`);
 }
 
 async function revealWritingAgentView(options: {
@@ -3293,6 +4371,89 @@ function normalizeRewriteOutput(text: string): string {
   return output;
 }
 
+function normalizeTextForRewriteCompare(text: string): string {
+  return (text || '')
+    .trim()
+    .toLowerCase()
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/\s+/g, '')
+    .replace(/[，。！？、；：,.!?;:()（）【】\[\]“”"'<>\-—]/g, '');
+}
+
+function textDiceSimilarity(left: string, right: string): number {
+  if (!left && !right) {
+    return 1;
+  }
+  if (!left || !right) {
+    return 0;
+  }
+  if (left === right) {
+    return 1;
+  }
+  const buildBigrams = (value: string): Map<string, number> => {
+    const map = new Map<string, number>();
+    if (value.length < 2) {
+      map.set(value, 1);
+      return map;
+    }
+    for (let i = 0; i < value.length - 1; i += 1) {
+      const key = value.slice(i, i + 2);
+      map.set(key, (map.get(key) || 0) + 1);
+    }
+    return map;
+  };
+  const leftBigrams = buildBigrams(left);
+  const rightBigrams = buildBigrams(right);
+  let intersection = 0;
+  leftBigrams.forEach((leftCount, key) => {
+    const rightCount = rightBigrams.get(key) || 0;
+    intersection += Math.min(leftCount, rightCount);
+  });
+  const leftSize = Array.from(leftBigrams.values()).reduce((sum, count) => sum + count, 0);
+  const rightSize = Array.from(rightBigrams.values()).reduce((sum, count) => sum + count, 0);
+  if (leftSize + rightSize === 0) {
+    return 0;
+  }
+  return (2 * intersection) / (leftSize + rightSize);
+}
+
+function isRewriteEffectivelyUnchanged(original: string, rewritten: string): boolean {
+  const left = normalizeTextForRewriteCompare(original);
+  const right = normalizeTextForRewriteCompare(rewritten);
+  if (!left || !right) {
+    return false;
+  }
+  if (left === right) {
+    return true;
+  }
+  if (left.length >= 24 && right.includes(left)) {
+    return true;
+  }
+  if (right.length >= 24 && left.includes(right)) {
+    return true;
+  }
+  return textDiceSimilarity(left, right) >= 0.985;
+}
+
+function buildStrictRewritePrompt(
+  basePrompt: string,
+  originalText: string
+): string {
+  return [
+    basePrompt,
+    '',
+    '强制改写要求：',
+    '1) 严禁直接复述原文；不得连续复用原文 12 个以上字符。',
+    '2) 必须重组句式与表达方式，保证和原文有明显差异。',
+    '3) 保持原意，但请输出可直接替换的改写文本。',
+    '',
+    '原文（再次提供，仅用于对照）：',
+    '<<<ORIGINAL',
+    originalText,
+    'ORIGINAL>>>'
+  ].join('\n');
+}
+
 function buildArticleDraft(
   topic: string,
   styleName: string,
@@ -3326,6 +4487,14 @@ function focusArticleBody(editor: vscode.TextEditor): void {
   const position = new vscode.Position(lastLine, lastChar);
   editor.selection = new vscode.Selection(position, position);
   editor.revealRange(new vscode.Range(position, position), vscode.TextEditorRevealType.InCenter);
+}
+
+async function ensureEditableEditor(editor: vscode.TextEditor): Promise<vscode.TextEditor> {
+  if (!editor.document.isClosed) {
+    return editor;
+  }
+  const reopened = await vscode.workspace.openTextDocument(editor.document.uri);
+  return vscode.window.showTextDocument(reopened, vscode.ViewColumn.One);
 }
 
 async function appendGeneratedDraftToEnd(
@@ -3364,17 +4533,21 @@ async function appendGeneratedDraftToEnd(
     ''
   ].join('\n');
 
-  const lastLine = editor.document.lineCount - 1;
-  const lastChar = editor.document.lineAt(lastLine).text.length;
+  const targetEditor = await ensureEditableEditor(editor);
+  const lastLine = targetEditor.document.lineCount - 1;
+  const lastChar = targetEditor.document.lineAt(lastLine).text.length;
   const position = new vscode.Position(lastLine, lastChar);
-  await editor.edit(editBuilder => {
+  const applied = await targetEditor.edit(editBuilder => {
     editBuilder.insert(position, block);
   });
-  const endLine = editor.document.lineCount - 1;
-  const endChar = editor.document.lineAt(endLine).text.length;
+  if (!applied) {
+    throw new Error('写入正文失败：编辑器不可写，请重试。');
+  }
+  const endLine = targetEditor.document.lineCount - 1;
+  const endChar = targetEditor.document.lineAt(endLine).text.length;
   const end = new vscode.Position(endLine, endChar);
-  editor.selection = new vscode.Selection(end, end);
-  editor.revealRange(new vscode.Range(end, end), vscode.TextEditorRevealType.InCenter);
+  targetEditor.selection = new vscode.Selection(end, end);
+  targetEditor.revealRange(new vscode.Range(end, end), vscode.TextEditorRevealType.InCenter);
 }
 
 async function appendOutlineToEnd(
@@ -3394,12 +4567,16 @@ async function appendOutlineToEnd(
     ''
   ].join('\n');
 
-  const lastLine = editor.document.lineCount - 1;
-  const lastChar = editor.document.lineAt(lastLine).text.length;
+  const targetEditor = await ensureEditableEditor(editor);
+  const lastLine = targetEditor.document.lineCount - 1;
+  const lastChar = targetEditor.document.lineAt(lastLine).text.length;
   const position = new vscode.Position(lastLine, lastChar);
-  await editor.edit(editBuilder => {
+  const applied = await targetEditor.edit(editBuilder => {
     editBuilder.insert(position, block);
   });
+  if (!applied) {
+    throw new Error('写入提纲失败：编辑器不可写，请重试。');
+  }
 }
 
 function generateLocalTopicOutlines(
